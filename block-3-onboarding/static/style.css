@@ -1,0 +1,323 @@
+/* Onboarding. One column, one accent, the text box as the loudest element on
+   the page — because it is the only input that actually reaches the ranker. */
+
+:root {
+  --bg: #0c0b0f;
+  --surface: #141319;
+  --surface-2: #1c1a22;
+  --line: #2a2833;
+  --ink: #f2f0ef;
+  --ink-dim: #a09daa;
+  --ink-faint: #6c6878;
+  --accent: #ff8a4c;
+  --accent-ink: #1a0d05;
+  --bad: #ff6b6b;
+  --good: #7ee0a8;
+  --radius: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(90ch 60ch at 12% -12%, #221a2e 0%, transparent 60%),
+    radial-gradient(70ch 50ch at 105% 8%, #2a1a16 0%, transparent 55%),
+    var(--bg);
+  background-attachment: fixed;
+  color: var(--ink);
+  font: 400 17px/1.6 ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.shell {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 72px 24px 96px;
+}
+
+/* --- type ----------------------------------------------------------------- */
+
+.eyebrow {
+  margin: 0 0 18px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+h1 {
+  margin: 0 0 14px;
+  font-size: clamp(34px, 6vw, 46px);
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  font-weight: 640;
+}
+
+.lede {
+  margin: 0 0 44px;
+  max-width: 46ch;
+  color: var(--ink-dim);
+  font-size: 18px;
+}
+
+.step {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.step span {
+  display: inline-block;
+  width: 22px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.hint {
+  margin: 0 0 16px 22px;
+  color: var(--ink-faint);
+  font-size: 14.5px;
+}
+
+.field {
+  margin-bottom: 40px;
+}
+
+/* --- chips ---------------------------------------------------------------- */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: 22px;
+}
+
+.chip input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.chip span {
+  display: block;
+  padding: 7px 15px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-dim);
+  font-size: 14.5px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.14s, color 0.14s, border-color 0.14s, transform 0.14s;
+}
+
+.chip span:hover {
+  border-color: #423e52;
+  color: var(--ink);
+}
+
+.chip input:checked + span {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 560;
+}
+
+.chip input:focus-visible + span {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.chip span:active {
+  transform: scale(0.97);
+}
+
+/* --- inputs --------------------------------------------------------------- */
+
+textarea,
+input[type="email"] {
+  display: block;
+  width: calc(100% - 22px);
+  margin-left: 22px;
+  padding: 15px 17px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  transition: border-color 0.14s, background 0.14s;
+}
+
+textarea {
+  min-height: 148px;
+  resize: none;
+  overflow: hidden;
+  line-height: 1.7;
+}
+
+textarea::placeholder,
+input::placeholder {
+  color: var(--ink-faint);
+}
+
+textarea:focus,
+input[type="email"]:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+
+input[type="email"] {
+  max-width: 340px;
+}
+
+/* --- submit --------------------------------------------------------------- */
+
+button.go {
+  margin-left: 22px;
+  padding: 14px 28px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: 600 16px/1 inherit;
+  font-family: inherit;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: opacity 0.14s, transform 0.14s;
+}
+
+button.go:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+button.go:disabled {
+  opacity: 0.34;
+  cursor: not-allowed;
+}
+
+.foot {
+  margin: 14px 0 0 22px;
+  color: var(--ink-faint);
+  font-size: 13.5px;
+}
+
+/* --- notices -------------------------------------------------------------- */
+
+.notice {
+  margin: 0 0 32px;
+  padding: 14px 18px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink-dim);
+  font-size: 15px;
+}
+
+.notice.bad {
+  border-left-color: var(--bad);
+  color: #ffc9c9;
+}
+
+.notice code {
+  color: var(--ink);
+  font-size: 13.5px;
+}
+
+/* --- done page ------------------------------------------------------------ */
+
+.pulse {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.3s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.8); }
+  50%      { opacity: 1;    transform: scale(1.15); }
+}
+
+.tick {
+  color: var(--good);
+}
+
+.elapsed {
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.showlist {
+  margin: 28px 0 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--line);
+}
+
+.showlist li {
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-dim);
+  font-size: 15px;
+}
+
+.showlist li::before {
+  content: "▸";
+  margin-right: 12px;
+  color: var(--ink-faint);
+}
+
+.morelink,
+a.plain {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+
+a.plain:hover {
+  border-bottom-color: var(--accent);
+}
+
+.next {
+  margin-top: 36px;
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.next p {
+  margin: 0 0 8px;
+  font-size: 15px;
+  color: var(--ink-dim);
+}
+
+.next p:last-child {
+  margin-bottom: 0;
+}
+
+.next strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

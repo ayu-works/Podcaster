@@ -1,0 +1,60 @@
+# Your interests. `text` goes into the ranking prompt word for word.
+# Groq generates focused catalogue search terms from each `text`. The terms
+# below are optional fallbacks used only with `--use-file-terms`.
+#
+# Sharpen the `text` lines whenever your interests change; they are the actual
+# signal used by both search expansion and ranking.
+
+[[interest]]
+text = "Cooking — technique, recipes, and the science of why food works"
+terms = [
+  "cooking",
+  "food",
+  "recipes",
+  "home cooking",
+  "chef",
+  "baking",
+  "food science",
+  "culinary",
+  "meal prep",
+  "cookbook",
+  "restaurant",
+  "food writing",
+]
+# dropped: "kitchen" (pickleball, WordPress), "eating" (baseball, endurance)
+
+[[interest]]
+text = "Using AI to automate real work, not AI news for its own sake"
+terms = [
+  "AI automation",
+  "automation",
+  "AI engineering",
+  "artificial intelligence",
+  "machine learning",
+  "AI tools",
+  "no code",
+  "workflow automation",
+  "business automation",
+  "LLM",
+  "AI agents",
+  "software engineering",
+]
+# dropped: "productivity" (generic self-help)
+
+[[interest]]
+text = "Design — product, interface, and visual craft"
+terms = [
+  "design",
+  "product design",
+  "UX",
+  "user experience",
+  "graphic design",
+  "design systems",
+  "typography",
+  "branding",
+  "UI design",
+  "art direction",
+  "industrial design",
+  "design thinking",
+]
+# dropped: "creative" (too vague, pulled misc business shows)

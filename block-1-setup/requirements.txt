@@ -1,0 +1,7 @@
+httpx
+feedparser
+groq
+jinja2
+resend
+flask
+python-dotenv

@@ -1,0 +1,46 @@
+# Copy to ../interests.toml (project root) and replace with your own.
+#
+# `text` is the signal. It goes into the ranking prompt word for word, so
+# write it the way you would say it out loud, and be specific:
+#   good — "AI agents in production, not demos"
+#   bad  — "AI"
+#
+# Groq generates 18 catalogue search terms from each `text` by default.
+# `terms` below are optional offline-debugging fallbacks, used only with the
+# `--use-file-terms` CLI flag.
+
+[[interest]]
+text = "AI agents in production, not demos"
+terms = [
+  "AI engineering",
+  "LLM infrastructure",
+  "MLOps",
+  "applied AI",
+  "AI developer tools",
+  "machine learning engineering",
+  "AI in production",
+  "software architecture",
+]
+
+[[interest]]
+text = "How early-stage startups actually find their first customers"
+terms = [
+  "startup go to market",
+  "early stage startups",
+  "founder interviews",
+  "B2B sales",
+  "product market fit",
+  "SaaS growth",
+  "bootstrapping",
+]
+
+[[interest]]
+text = "Indian macroeconomics and public policy"
+terms = [
+  "Indian economy",
+  "India policy",
+  "emerging markets",
+  "macroeconomics",
+  "public policy India",
+  "economic policy",
+]

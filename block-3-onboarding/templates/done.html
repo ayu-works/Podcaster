@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Setting up your digest — Podcaster{% endblock %}
+
+{% block content %}
+<p class="eyebrow">Podcaster</p>
+
+{% if job is none %}
+  <h1>We lost track of that build.</h1>
+  <p class="lede">
+    The server restarted while it was running. Your account is fine — just
+    <a class="plain" href="{{ url_for('onboard') }}">submit the form again</a>
+    to rebuild the list.
+  </p>
+{% else %}
+  <h1 id="head"><span class="pulse"></span>Building your list…</h1>
+  <p class="lede" id="sub">
+    Searching the catalogue for shows that match what you wrote. This is the
+    slow part, and it only happens once. <span class="elapsed" id="elapsed"></span>
+  </p>
+
+  <div class="next" id="detail">
+    <p><strong>{{ job.email }}</strong></p>
+    {% for text in job.interests %}<p>{{ text }}</p>{% endfor %}
+  </div>
+
+  <ul class="showlist" id="shows" hidden></ul>
+
+  <script>
+    const jobId = {{ job_id | tojson }};
+    const head = document.getElementById('head');
+    const sub = document.getElementById('sub');
+    const elapsed = document.getElementById('elapsed');
+    const shows = document.getElementById('shows');
+    const started = Date.now();
+
+    const tick = setInterval(() => {
+      elapsed.textContent = Math.round((Date.now() - started) / 1000) + 's';
+    }, 1000);
+
+    function finish(html) {
+      clearInterval(tick);
+      head.innerHTML = html;
+    }
+
+    async function poll() {
+      let data;
+      try {
+        const res = await fetch('/status/' + jobId);
+        data = await res.json();
+      } catch (err) {
+        return setTimeout(poll, 3000);
+      }
+
+      if (data.state === 'building') return setTimeout(poll, 1500);
+
+      if (data.state === 'done') {
+        finish('<span class="tick">✓</span> You\'re subscribed.');
+        sub.innerHTML = 'We\'ll watch <strong>' + data.shows +
+          ' shows</strong> for you. First digest lands on the next run day at 7am ' +
+          '— and only if something is genuinely worth it.';
+        if (data.preview.length) {
+          shows.hidden = false;
+          shows.innerHTML = data.preview
+            .map(name => '<li></li>')
+            .join('');
+          [...shows.children].forEach((li, i) => { li.textContent = data.preview[i]; });
+          shows.insertAdjacentHTML('beforeend',
+            '<li style="border:0;color:var(--ink-faint)">…and ' +
+            (data.shows - data.preview.length) + ' more</li>');
+        }
+        return;
+      }
+
+      finish('Something went wrong.');
+      sub.textContent = 'Your account and interests were saved, but the show ' +
+        'search failed, so there is nothing to recommend from yet.';
+      shows.hidden = false;
+      shows.innerHTML = '<li style="color:#ffc9c9"></li>';
+      shows.firstChild.textContent = data.error || 'Build did not complete.';
+      shows.insertAdjacentHTML('beforeend',
+        '<li style="border:0"><a class="plain" href="{{ url_for("onboard") }}">' +
+        'Try again</a></li>');
+    }
+
+    poll();
+  </script>
+{% endif %}
+{% endblock %}

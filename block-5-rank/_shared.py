@@ -1,0 +1,21 @@
+"""Import shim: Block 1's config and db, Block 2's API client, Block 4's fetch.
+
+This folder comes first on `sys.path`, so its `_shared` shadows the ones in the
+other blocks. `config` and `db` are bound here before anything imports them.
+Import `fetch` and `podcastindex` from the caller, not from this file.
+"""
+
+import pathlib
+import sys
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+for _folder in ("block-4-fetch", "block-2-universe", "block-1-setup"):
+    _path = str(_ROOT / _folder)
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+import config  # noqa: E402
+import db  # noqa: E402
+
+__all__ = ["config", "db"]
