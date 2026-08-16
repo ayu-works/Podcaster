@@ -1,0 +1,440 @@
+"""Tag each new episode once for the shared pool (ARCHITECTURE section 6)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+from groq import APIStatusError, Groq, RateLimitError
+
+from _shared import config, db
+
+SYSTEM_PROMPT = f"""You tag podcast episodes for a recommendation service. You are a filter,
+not a feed. Your job is to protect listeners' time.
+
+For each episode return:
+- topics: 0-3 slugs from the allowed list. Only slugs the episode is
+  genuinely ABOUT. An empty array is correct and common - an episode that
+  fits nothing is dropped, which is the desired outcome.
+- score: 0-100, how much this is worth a listener's time. 70 means "worth
+  it". Be harsh; most episodes are not worth most people's time. Prefer
+  episodes whose description names a concrete claim, guest, case study or
+  number. Vague descriptions score low even when on-topic.
+- why: ONE sentence that MUST reference something specific from that
+  episode's description - a named guest, a claim, a case study, a number.
+  Generic praise ("a great listen", "perfect for anyone interested in X")
+  is a failed output, not a weak one.
+
+Allowed topic slugs:
+{", ".join(config.TOPIC_SLUGS)}
+
+Output ONLY valid JSON:
+{{"episodes":[{{"id":<int>,"topics":["<slug>"],"score":<int>,"why":"<one sentence>"}}]}}"""
+
+RETRY_NOTE = (
+    "Your previous response could not be parsed as the required JSON: {error}\n"
+    "Return every episode again and output only the JSON object."
+)
+
+_GENERIC_PHRASES = (
+    "great listen", "must-listen", "must listen", "highly relevant",
+    "worth a listen", "right up your", "perfect for anyone", "if you are interested",
+    "anyone interested in", "a great episode", "sure to appeal", "will appreciate",
+)
+_WORD_RE = re.compile(r"[a-z][a-z'-]{4,}")
+
+
+class TagError(RuntimeError):
+    """The tagging service failed in a way that must stop the pipeline."""
+
+
+class AttemptsExhausted(RuntimeError):
+    """An episode reached its bounded retry cap."""
+
+
+class BudgetExhausted(RuntimeError):
+    """The daily token budget cannot safely fit another call."""
+
+
+@dataclass
+class ParsedTag:
+    index: int
+    topics: list[str]
+    score: int
+    why: str
+
+
+@dataclass
+class TagResult:
+    selected: int = 0
+    attempted: int = 0
+    tagged: int = 0
+    generic: int = 0
+    invalid: int = 0
+    parse_failed: int = 0
+    abandoned: int = 0
+    untagged_left: int = 0
+    tokens_used: int = 0
+    budget_exhausted: bool = False
+    rows: list[tuple[int, int, list[str], str]] = field(default_factory=list)
+
+
+@dataclass
+class CallState:
+    tokens_used: int = 0
+    last_call_at: float | None = None
+    last_call_tokens: int = 0
+    attempts: dict[int, int] = field(default_factory=dict)
+
+
+def format_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "?"
+    return f"{round(seconds / 60)}m"
+
+
+def looks_generic(reason: str, description: str) -> bool:
+    """True when a reason could have been written without reading the episode."""
+    low = reason.casefold()
+    if any(phrase in low for phrase in _GENERIC_PHRASES):
+        return True
+    desc_words = set(_WORD_RE.findall((description or "").casefold()))
+    return not desc_words & set(_WORD_RE.findall(low))
+
+
+def candidate_line(index: int, row: sqlite3.Row) -> str:
+    return (
+        f"[{index}] show: {row['show_name']} | title: {row['title']} | "
+        f"{format_duration(row['duration_sec'])} | "
+        f"desc: {(row['description'] or '')[: config.DESC_TRUNCATE]}"
+    )
+
+
+def build_prompt(rows: list[sqlite3.Row]) -> str:
+    return "\n".join(candidate_line(index, row) for index, row in enumerate(rows, 1))
+
+
+def log_call(batch_id: int, label: str, prompt: str, raw: str) -> None:
+    config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with config.TAG_LOG_PATH.open("a", encoding="utf-8") as log:
+        log.write(
+            f"\n{'=' * 78}\n{stamp}  batch={batch_id}  model={config.GROQ_MODEL}  {label}\n"
+            f"{'=' * 78}\n--- SYSTEM ---\n{SYSTEM_PROMPT}\n"
+            f"--- USER ---\n{prompt}\n--- RESPONSE ---\n{raw}\n"
+        )
+
+
+def parse_tags(raw: str, candidate_count: int) -> tuple[dict[int, ParsedTag], int]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    data = json.loads(text)
+    if not isinstance(data, dict) or not isinstance(data.get("episodes"), list):
+        raise ValueError("response must contain an 'episodes' list")
+
+    parsed: dict[int, ParsedTag] = {}
+    invalid = 0
+    for entry in data["episodes"]:
+        try:
+            index = int(entry["id"])
+            score = int(entry["score"])
+            why = str(entry["why"]).strip()
+            topics = entry["topics"]
+        except (KeyError, TypeError, ValueError):
+            invalid += 1
+            continue
+        if (
+            not 1 <= index <= candidate_count
+            or index in parsed
+            or not 0 <= score <= 100
+            or not why
+            or not isinstance(topics, list)
+        ):
+            invalid += 1
+            continue
+        valid_topics = [
+            topic
+            for topic in dict.fromkeys(str(topic) for topic in topics)
+            if topic in config.TOPIC_SLUGS
+        ][: config.TAG_MAX_TOPICS]
+        parsed[index] = ParsedTag(index, valid_topics, score, why)
+    return parsed, invalid
+
+
+def load_queue(conn, limit: int | None = None) -> list[sqlite3.Row]:
+    sql = (
+        "SELECT * FROM episode WHERE tagged_at IS NULL AND tag_attempts < ? "
+        "ORDER BY published_at DESC, id"
+    )
+    params: list[int] = [config.TAG_MAX_ATTEMPTS]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def estimate_call_tokens(prompt: str) -> int:
+    input_tokens = (len(SYSTEM_PROMPT) + len(prompt)) // 4 + 1
+    return input_tokens + config.TAG_COMPLETION_TOKENS
+
+
+def _pace(state: CallState) -> None:
+    if state.last_call_at is None or state.last_call_tokens <= 0:
+        return
+    interval = state.last_call_tokens / config.GROQ_TPM * 60
+    remaining = interval - (time.monotonic() - state.last_call_at)
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _retry_after(exc: APIStatusError) -> float:
+    value = exc.response.headers.get("retry-after")
+    try:
+        return float(value) if value else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _record_attempt(
+    conn,
+    rows: list[sqlite3.Row],
+    state: CallState,
+    dry_run: bool,
+) -> None:
+    for row in rows:
+        state.attempts[row["id"]] = state.attempts.get(
+            row["id"], row["tag_attempts"]
+        ) + 1
+    if dry_run:
+        return
+    conn.executemany(
+        "UPDATE episode SET tag_attempts = tag_attempts + 1, tag_error = NULL WHERE id = ?",
+        [(row["id"],) for row in rows],
+    )
+
+
+def _call(
+    conn,
+    rows: list[sqlite3.Row],
+    messages: list[dict[str, str]],
+    prompt: str,
+    batch_id: int,
+    client: Groq,
+    state: CallState,
+    dry_run: bool,
+    budget: int,
+) -> str:
+    for retry in range(config.TAG_MAX_ATTEMPTS):
+        if any(
+            state.attempts.get(row["id"], row["tag_attempts"])
+            >= config.TAG_MAX_ATTEMPTS
+            for row in rows
+        ):
+            raise AttemptsExhausted
+        if state.tokens_used + estimate_call_tokens(prompt) > budget:
+            raise BudgetExhausted
+        _pace(state)
+        _record_attempt(conn, rows, state, dry_run)
+        try:
+            state.last_call_at = time.monotonic()
+            response = client.chat.completions.create(
+                model=config.GROQ_MODEL,
+                messages=messages,
+                temperature=0,
+                max_completion_tokens=config.TAG_COMPLETION_TOKENS,
+                reasoning_effort=config.TAG_REASONING_EFFORT,
+                response_format={"type": "json_object"},
+            )
+        except RateLimitError as exc:
+            if retry == config.TAG_MAX_ATTEMPTS - 1:
+                raise TagError("Groq rate limit persisted through all attempts") from exc
+            time.sleep(max(_retry_after(exc), 2**retry))
+            continue
+        except Exception as exc:
+            raise TagError(f"Groq tagging call failed: {type(exc).__name__}: {exc}") from exc
+
+        raw = response.choices[0].message.content or ""
+        usage = getattr(response, "usage", None)
+        used = int(getattr(usage, "total_tokens", 0) or estimate_call_tokens(prompt))
+        state.last_call_tokens = used
+        state.tokens_used += used
+        log_call(batch_id, "retry" if len(messages) > 2 else "tag", prompt, raw)
+        return raw
+    raise TagError("unreachable call retry state")
+
+
+def _write_batch(
+    conn,
+    rows: list[sqlite3.Row],
+    parsed: dict[int, ParsedTag],
+    result: TagResult,
+    dry_run: bool,
+) -> None:
+    for index, row in enumerate(rows, 1):
+        tag = parsed.get(index)
+        if tag is None:
+            result.invalid += 1
+            if not dry_run:
+                conn.execute(
+                    "UPDATE episode SET tag_error = 'missing or invalid response entry' WHERE id = ?",
+                    (row["id"],),
+                )
+            continue
+        if looks_generic(tag.why, row["description"]):
+            result.generic += 1
+            if not dry_run:
+                conn.execute(
+                    "UPDATE episode SET tag_error = 'generic or ungrounded why' WHERE id = ?",
+                    (row["id"],),
+                )
+            continue
+
+        result.tagged += 1
+        result.rows.append((row["id"], tag.score, tag.topics, tag.why))
+        if dry_run:
+            continue
+        conn.execute(
+            "UPDATE episode SET score = ?, why = ?, tagged_at = datetime('now'), "
+            "tag_error = NULL WHERE id = ?",
+            (tag.score, tag.why, row["id"]),
+        )
+        conn.execute("DELETE FROM episode_topic WHERE episode_id = ?", (row["id"],))
+        conn.executemany(
+            "INSERT INTO episode_topic (episode_id, topic) VALUES (?, ?)",
+            [(row["id"], topic) for topic in tag.topics],
+        )
+
+
+def tag_all(
+    conn,
+    limit: int | None = None,
+    dry_run: bool = False,
+    client: Groq | None = None,
+    daily_budget: int | None = None,
+) -> TagResult:
+    if not config.GROQ_API_KEY and client is None:
+        raise TagError("GROQ_API_KEY missing from .env; tagging cannot run")
+    rows = load_queue(conn, limit)
+    result = TagResult(selected=len(rows))
+    if not rows:
+        return result
+
+    groq = client or Groq(api_key=config.GROQ_API_KEY)
+    budget = config.GROQ_TPD if daily_budget is None else daily_budget
+    state = CallState()
+
+    for start in range(0, len(rows), config.TAG_BATCH_SIZE):
+        batch = rows[start : start + config.TAG_BATCH_SIZE]
+        prompt = build_prompt(batch)
+        if state.tokens_used + estimate_call_tokens(prompt) > budget:
+            result.budget_exhausted = True
+            break
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        parsed: dict[int, ParsedTag] | None = None
+        parse_error: Exception | None = None
+        attempts_before = sum(state.attempts.values())
+        stop_for_budget = False
+        for parse_attempt in range(2):
+            try:
+                raw = _call(
+                    conn, batch, messages, prompt, start // config.TAG_BATCH_SIZE + 1,
+                    groq, state, dry_run, budget,
+                )
+                parsed, invalid = parse_tags(raw, len(batch))
+                result.invalid += invalid
+                break
+            except TagError as exc:
+                if not dry_run:
+                    conn.executemany(
+                        "UPDATE episode SET tag_error = ? WHERE id = ?",
+                        [(str(exc), row["id"]) for row in batch],
+                    )
+                    conn.commit()
+                raise
+            except BudgetExhausted:
+                result.budget_exhausted = True
+                stop_for_budget = True
+                break
+            except AttemptsExhausted:
+                break
+            except (json.JSONDecodeError, ValueError) as exc:
+                parse_error = exc
+                if parse_attempt == 0:
+                    messages += [
+                        {"role": "assistant", "content": raw},
+                        {"role": "user", "content": RETRY_NOTE.format(error=exc)},
+                    ]
+        if sum(state.attempts.values()) > attempts_before:
+            result.attempted += len(batch)
+        if parsed is None:
+            if parse_error is not None:
+                result.parse_failed += len(batch)
+            if not dry_run:
+                conn.executemany(
+                    "UPDATE episode SET tag_error = ? WHERE id = ?",
+                    [
+                        (
+                            f"unparseable response: {parse_error}"
+                            if parse_error is not None
+                            else "tag attempts exhausted",
+                            row["id"],
+                        )
+                        for row in batch
+                    ],
+                )
+        else:
+            _write_batch(conn, batch, parsed, result, dry_run)
+        if not dry_run:
+            conn.commit()
+        if stop_for_budget:
+            break
+
+    result.tokens_used = state.tokens_used
+    if not dry_run:
+        result.untagged_left = conn.execute(
+            "SELECT COUNT(*) FROM episode WHERE tagged_at IS NULL "
+            "AND tag_attempts < ?",
+            (config.TAG_MAX_ATTEMPTS,),
+        ).fetchone()[0]
+        result.abandoned = conn.execute(
+            "SELECT COUNT(*) FROM episode WHERE tagged_at IS NULL "
+            "AND tag_attempts >= ?",
+            (config.TAG_MAX_ATTEMPTS,),
+        ).fetchone()[0]
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    with db.session() as conn:
+        result = tag_all(conn, limit=args.limit, dry_run=args.dry_run)
+
+    print(
+        f"selected {result.selected}, attempted {result.attempted}, tagged {result.tagged}, "
+        f"generic {result.generic}, invalid {result.invalid}, "
+        f"tokens {result.tokens_used}, untagged_left {result.untagged_left}, "
+        f"abandoned {result.abandoned}"
+    )
+    if result.budget_exhausted:
+        print("daily token budget reached; remainder left untouched for the next run")
+    for episode_id, score, topics, why in result.rows[:20]:
+        print(f"{episode_id:>6}  {score:>3}  {','.join(topics) or '-'}  {why}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

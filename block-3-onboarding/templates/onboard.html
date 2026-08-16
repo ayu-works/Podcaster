@@ -1,118 +1,65 @@
 {% extends "base.html" %}
-{% block title %}Podcaster — two episodes, every other day{% endblock %}
+{% block title %}Podcaster — the best new episodes for you{% endblock %}
 
 {% block content %}
 <p class="eyebrow">Podcaster</p>
-<h1>Two episodes worth<br>your time. That's it.</h1>
+<h1>Good episodes.<br>Only when they're worth it.</h1>
 <p class="lede">
-  Every other morning we read what's new across a few hundred shows and send
-  you at most two. If nothing is good enough, we send nothing.
+  We search what was released, judge each episode on its substance, and send
+  up to ten that match your topics. A quiet day stays quiet.
 </p>
 
 {% if missing_keys %}
 <div class="notice bad">
-  <strong>Not ready yet.</strong> Add <code>{{ missing_keys | join(', ') }}</code>
-  to <code>.env</code> before subscribing — the show search will fail without them.
+  <strong>Email is not configured yet.</strong> Add
+  <code>{{ missing_keys | join(', ') }}</code> before public signup.
 </div>
 {% endif %}
-
-{% if error %}
-<div class="notice bad">{{ error }}</div>
-{% endif %}
+{% if error %}<div class="notice bad">{{ error }}</div>{% endif %}
 
 <form method="post" action="{{ url_for('subscribe') }}" id="form">
+  <div class="trap" aria-hidden="true">
+    <label>Company <input name="company" tabindex="-1" autocomplete="off"></label>
+  </div>
 
-  <div class="field">
-    <p class="step"><span>1</span>Pick a few areas</p>
-    <p class="hint">Rough is fine. Each one you tap opens a line below.</p>
+  <fieldset class="field">
+    <legend class="step"><span>1</span>What do you want to hear about?</legend>
+    <p class="hint">Choose one or as many as you like. You can change them later.</p>
     <div class="chips">
-      {% for chip in chips %}
+      {% for slug, label in topics %}
       <label class="chip">
-        <input type="checkbox" name="chip" value="{{ chip }}"
-               {% if chip in form.get('chips', []) %}checked{% endif %}>
-        <span>{{ chip }}</span>
+        <input type="checkbox" name="topic" value="{{ slug }}"
+               {% if slug in form.get('topics', []) %}checked{% endif %}>
+        <span>{{ label }}</span>
       </label>
       {% endfor %}
     </div>
-  </div>
+  </fieldset>
 
   <div class="field">
-    <p class="step"><span>2</span>Now the part that matters</p>
-    <p class="hint">
-      What specifically, within those? One per line, in your own words — this
-      goes to the recommender exactly as you write it.
-      <br>“AI agents in production, not demos” beats “AI” by a mile.
-    </p>
-    <textarea id="specifics" name="specifics" rows="5" spellcheck="true"
-      placeholder="Braising, knife work, and why recipes actually work&#10;Using AI to automate real work, not AI news&#10;Interface design and visual craft">{{ form.get('specifics', '') }}</textarea>
-  </div>
-
-  <div class="field">
-    <p class="step"><span>3</span>Where do we send it?</p>
-    <p class="hint">Mondays, Wednesdays, Fridays and Sundays at 7am. Nothing else, ever.</p>
+    <label class="step" for="email"><span>2</span>Where should it arrive?</label>
+    <p class="hint">We'll send one confirmation link first. No confirmation, no digest.</p>
     <input type="email" id="email" name="email" placeholder="you@example.com"
-           autocomplete="email" value="{{ form.get('email', '') }}">
+           autocomplete="email" required value="{{ form.get('email', '') }}">
   </div>
 
   <button class="go" type="submit" id="go" {% if missing_keys %}disabled{% endif %}>
-    Build my list
+    Send confirmation
   </button>
-  <p class="foot" id="foot">Takes about half a minute — we search the catalogue once, now.</p>
+  <p class="foot">No daily filler. No account or password. Unsubscribe in one click.</p>
 </form>
 
 <script>
-  const box = document.getElementById('specifics');
   const email = document.getElementById('email');
   const go = document.getElementById('go');
-  const foot = document.getElementById('foot');
-  const chips = [...document.querySelectorAll('input[name=chip]')];
+  const topics = [...document.querySelectorAll('input[name=topic]')];
   const blocked = {{ 'true' if missing_keys else 'false' }};
-
-  const grow = () => {
-    box.style.height = 'auto';
-    box.style.height = Math.max(148, box.scrollHeight) + 'px';
-  };
-
-  const lines = () =>
-    box.value.split('\n')
-      .map(l => l.replace(/^[-•*\s]+/, '').replace(/[\s\-–—:,]+$/, '').trim())
-      .filter(l => l.length >= 3 && !chips.some(c => c.value === l));
-
   function check() {
     if (blocked) return;
-    const picked = chips.filter(c => c.checked).length;
-    const written = lines().length;
-    const ok = /^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(email.value.trim())
-               && (written > 0 || picked >= 3);
-    go.disabled = !ok;
-    foot.textContent = written > 6
-      ? 'Only the first 6 lines are used — trim it to the ones you care about.'
-      : 'Takes about half a minute — we search the catalogue once, now.';
+    go.disabled = !email.validity.valid || !topics.some(topic => topic.checked);
   }
-
-  // A chip seeds an editable line rather than becoming an interest itself.
-  // Unchecking only removes the line if it was never filled in.
-  chips.forEach(chip => chip.addEventListener('change', () => {
-    const seed = chip.value + ' — ';
-    if (chip.checked) {
-      const already = box.value.split('\n').some(l => l.trim().startsWith(chip.value));
-      if (!already) {
-        box.value = box.value.trim() ? box.value.replace(/\n*$/, '\n') + seed : seed;
-        box.focus();
-        box.setSelectionRange(box.value.length, box.value.length);
-      }
-    } else {
-      box.value = box.value.split('\n')
-        .filter(l => l.trim() !== seed.trim() && l.trim() !== chip.value)
-        .join('\n');
-    }
-    grow();
-    check();
-  }));
-
-  box.addEventListener('input', () => { grow(); check(); });
   email.addEventListener('input', check);
-  grow();
+  topics.forEach(topic => topic.addEventListener('change', check));
   check();
 </script>
 {% endblock %}

@@ -184,7 +184,9 @@ def connect(url=None, token=None):
     """
     url = config.DATABASE_URL if url is None else url
 
-    if url and (url.startswith("libsql://") or url.startswith("https://")):
+    if isinstance(url, str) and (
+        url.startswith("libsql://") or url.startswith("https://")
+    ):
         import libsql  # noqa: local import, see docstring
 
         conn = libsql.connect(url, auth_token=token or config.DATABASE_TOKEN)
@@ -229,7 +231,11 @@ def connect(url=None, token=None):
 
     # Local SQLite fallback. WAL is a local-file concern and dropped for
     # the Turso branch above, but it's still correct here.
-    path = url[len("file:"):] if url and url.startswith("file:") else (url or config.DB_PATH)
+    path = (
+        url[len("file:") :]
+        if isinstance(url, str) and url.startswith("file:")
+        else (url or config.DB_PATH)
+    )
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")

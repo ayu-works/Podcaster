@@ -1,39 +1,40 @@
-"""Pull new episodes from the user's shows, then filter them down (ARCHITECTURE section 6).
+"""Discover recent category feeds, then fetch their episodes in ID batches.
 
 Two stages, deliberately separate.
 
-**Stage 1, fetch.** Ask each of the ~200 candidate shows for episodes published
-since `user.last_run_at`, 15 feeds at a time. Upsert into `episode` on `guid`.
+**Stage 1, discover and fetch.** Stamp `run.fetch_cutoff_at`, query recently
+updated feeds across the 20 mapped categories, balance them to the daily token
+budget, then fetch episodes with up to 200 feed IDs per API request. Upsert into
+`episode` on `guid`.
 
-The window is `last_run_at`, never "the last two days". A fixed window silently
-drops episodes whenever a run fails or the laptop was asleep; using the last
-successful run means a missed Wednesday gets picked up on Friday. It is capped
-at `MAX_LOOKBACK_DAYS` so a long gap produces a digest, not a flood.
+The window is the last good `run.fetch_cutoff_at`, never "the last two days".
+A fixed window silently drops episodes whenever a run fails; using the last
+successful/partial run means a missed Wednesday gets picked up on Friday. It is
+capped at `MAX_LOOKBACK_DAYS` so a long gap produces a digest, not a flood.
 
-**Stage 2, filter.** Cheap, deterministic, no LLM: drop anything already sent to
-this user, anything with a description too thin to judge, and anything too short
-to be an episode. The description rule does the most work — the ranker cannot
-judge what it cannot read, and thin descriptions are the largest single source
-of bad picks.
-
-The "already sent" rule lives here, before the ranker ever sees a candidate.
-The LLM is never responsible for remembering (ARCHITECTURE section 5).
+**Stage 2, filter.** Cheap, deterministic, no LLM: drop descriptions too thin
+to judge and anything too short to be an episode. There is deliberately no
+already-sent join here: `sent` is per subscriber, while this pool is shared.
+One subscriber's history must never hide an episode from another.
 """
 
 import argparse
+import csv
 import html
 import re
 import sqlite3
 import sys
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 
 from _shared import config, db
+import discover
 import podcastindex
 
 # Episode types the catalogue marks as not-an-episode. Dropped before the
@@ -66,8 +67,10 @@ class NewEpisode:
 
 @dataclass
 class FetchResult:
+    run_id: int
     since: int
     shows: int
+    discovered: int = 0
     raw: int = 0
     stored: int = 0
     candidates: list[sqlite3.Row] = field(default_factory=list)
@@ -85,9 +88,9 @@ class FetchResult:
 def since_timestamp(last_run_at: str | None, max_days: int | None = None) -> int:
     """Unix seconds to fetch from: the last successful run, floored at the cap.
 
-    `last_run_at` is written by SQLite's `datetime('now')`, which is UTC with no
-    timezone marker. Parsing it as naive local time would shift the window by
-    hours and quietly lose or repeat episodes.
+    The stored cutoff is written by SQLite's `datetime('now')`, which is UTC
+    with no timezone marker. Parsing it as local time would shift the window
+    and quietly lose or repeat episodes.
     """
     days = config.MAX_LOOKBACK_DAYS if max_days is None else max_days
     floor = datetime.now(timezone.utc) - timedelta(days=days)
@@ -149,39 +152,68 @@ def to_episode(item: dict, fallback_show: str) -> NewEpisode | None:
     )
 
 
-def fetch_feeds(shows: list[sqlite3.Row], since: int) -> tuple[list[NewEpisode], int, int]:
-    """Poll every show concurrently. Returns (episodes, raw_items, failed_feeds).
+def _show_value(show, key: str):
+    if isinstance(show, (sqlite3.Row, dict)):
+        return show[key]
+    if key == "show_name":
+        return show.title
+    return getattr(show, key)
+
+
+def fetch_feeds(
+    shows: list,
+    since: int,
+    progress=None,
+) -> tuple[list[NewEpisode], int, int]:
+    """Fetch up to 200 shows per request. Returns episodes, raw, failed feeds.
 
     One dead feed must not take down the run, so per-feed failures are counted
     rather than raised. Every feed failing is a different thing entirely — that
     is a bad key or no network, and it is indistinguishable from a quiet week
     unless it raises.
     """
-    limits = httpx.Limits(max_connections=config.FEED_WORKERS)
+    limits = httpx.Limits(max_connections=config.FETCH_BATCH_WORKERS)
     episodes: list[NewEpisode] = []
     raw = 0
     failed = 0
 
     with httpx.Client(timeout=podcastindex.TIMEOUT, limits=limits) as client:
 
-        def poll(show: sqlite3.Row) -> list[dict]:
-            return podcastindex.episodes_by_feed(
-                show["feed_id"],
+        batches = [
+            shows[start : start + config.EPISODE_FEED_BATCH_SIZE]
+            for start in range(0, len(shows), config.EPISODE_FEED_BATCH_SIZE)
+        ]
+
+        def poll(batch: list) -> list[dict]:
+            return podcastindex.episodes_by_feed_ids(
+                [_show_value(show, "feed_id") for show in batch],
                 since=since,
-                max_results=config.EPISODES_PER_FEED,
+                max_results=config.EPISODE_BATCH_MAX_RESULTS,
                 client=client,
             )
 
-        with ThreadPoolExecutor(max_workers=config.FEED_WORKERS) as pool:
-            for show, items in zip(shows, pool.map(_safe(poll), shows)):
+        show_names = {
+            _show_value(show, "feed_id"): _show_value(show, "show_name")
+            for show in shows
+        }
+        with ThreadPoolExecutor(max_workers=config.FETCH_BATCH_WORKERS) as pool:
+            futures = {pool.submit(_safe(poll), batch): batch for batch in batches}
+            completed = 0
+            for future in as_completed(futures):
+                batch = futures[future]
+                items = future.result()
                 if items is None:
-                    failed += 1
-                    continue
-                raw += len(items)
-                for item in items:
-                    episode = to_episode(item, show["show_name"])
-                    if episode is not None:
-                        episodes.append(episode)
+                    failed += len(batch)
+                else:
+                    raw += len(items)
+                    for item in items:
+                        fallback = show_names.get(int(item.get("feedId") or 0), "")
+                        episode = to_episode(item, fallback)
+                        if episode is not None:
+                            episodes.append(episode)
+                completed += len(batch)
+                if progress is not None:
+                    progress(completed, len(shows), raw, failed)
 
     if shows and failed == len(shows):
         raise FetchError(
@@ -249,92 +281,132 @@ def upsert_episodes(conn, episodes: list[NewEpisode]) -> list[int]:
 # --- stage 2: filter ---------------------------------------------------------
 
 
-def filter_episodes(
-    conn, user_id: int, episode_ids: list[int]
-) -> tuple[list[sqlite3.Row], Counter]:
-    """Apply the four cheap rules, and account for every episode dropped.
+def filter_episodes(episodes: list[NewEpisode]) -> tuple[list[NewEpisode], Counter]:
+    """Apply the global cheap rules and account for every episode dropped.
 
-    The counts matter as much as the survivors: `after_filter` collapsing is
-    the signal that the universe is too narrow, and from the outside that looks
-    identical to a quiet week (ARCHITECTURE section 10).
+    This runs before the upsert because every row with `tagged_at IS NULL` is
+    tagger work. Storing a 20-character description and merely hiding it from
+    this function's return value would still spend LLM tokens on it in Step 5.
     """
     dropped: Counter = Counter()
-    kept: list[sqlite3.Row] = []
+    kept: list[NewEpisode] = []
     seen: set[str] = set()
 
-    for start in range(0, len(episode_ids), _CHUNK):
-        batch = episode_ids[start : start + _CHUNK]
-        placeholders = ",".join("?" for _ in batch)
-        rows = conn.execute(
-            f"""
-            SELECT e.*,
-                   EXISTS (
-                       SELECT 1 FROM digest_item di
-                       JOIN digest d ON d.id = di.digest_id
-                       WHERE di.episode_id = e.id AND d.user_id = ?
-                         AND d.kind IN ('sent', 'pending')
-                   ) AS already_sent
-            FROM episode e
-            WHERE e.id IN ({placeholders})
-            ORDER BY e.published_at DESC
-            """,
-            [user_id, *batch],
-        ).fetchall()
+    for episode in episodes:
+        if episode.guid in seen:
+            dropped["duplicate guid"] += 1
+        elif len(episode.description) < config.MIN_DESC_CHARS:
+            dropped[f"description under {config.MIN_DESC_CHARS} chars"] += 1
+        elif (
+            episode.duration_sec is not None
+            and episode.duration_sec < config.MIN_EPISODE_SEC
+        ):
+            dropped[f"under {config.MIN_EPISODE_SEC // 60} minutes"] += 1
+        else:
+            seen.add(episode.guid)
+            kept.append(episode)
 
-        for row in rows:
-            if row["already_sent"]:
-                dropped["already sent"] += 1
-            elif row["guid"] in seen:
-                dropped["duplicate guid"] += 1
-            elif len(row["description"] or "") < config.MIN_DESC_CHARS:
-                dropped[f"description under {config.MIN_DESC_CHARS} chars"] += 1
-            elif row["duration_sec"] is not None and row["duration_sec"] < config.MIN_EPISODE_SEC:
-                dropped[f"under {config.MIN_EPISODE_SEC // 60} minutes"] += 1
-            else:
-                seen.add(row["guid"])
-                kept.append(row)
-
-    kept.sort(key=lambda r: r["published_at"] or "", reverse=True)
+    kept.sort(key=lambda episode: episode.published_at or "", reverse=True)
     return kept, dropped
 
 
 # --- the block's entry point -------------------------------------------------
 
 
-def load_shows(conn, user_id: int) -> list[sqlite3.Row]:
+def load_shows(conn) -> list[sqlite3.Row]:
     return conn.execute(
-        "SELECT feed_id, feed_url, show_name FROM candidate_show "
-        "WHERE user_id = ? AND status = 'active' ORDER BY id",
-        (user_id,),
+        "SELECT feed_id, feed_url, title AS show_name FROM show "
+        "WHERE status = 'active' ORDER BY id"
     ).fetchall()
 
 
-def fetch_for_user(conn, user_id: int, since: int | None = None) -> FetchResult:
-    """Everything Block 5 needs: fresh episodes, filtered, newest first.
+def fetch_all(
+    conn,
+    since: int | None = None,
+    run_id: int | None = None,
+    progress=None,
+    refresh_discovery: bool = True,
+) -> FetchResult:
+    """Fetch the shared universe and leave taggable rows in `episode`.
 
-    Does **not** advance `user.last_run_at`. That belongs to the run job, after
-    a successful delivery — fetching and then failing must not consume the
-    window.
+    `fetch_cutoff_at` is committed before the first outbound call. The commit
+    is intentional: if the process dies while polling, the attempt record must
+    still exist. A failed/running row does not advance `last_good_cutoff()`, so
+    the next complete run safely re-covers the same window.
     """
-    row = conn.execute("SELECT last_run_at FROM user WHERE id = ?", (user_id,)).fetchone()
-    if row is None:
-        raise FetchError(f"No user with id {user_id}.")
+    if run_id is None:
+        cursor = conn.execute("INSERT INTO run DEFAULT VALUES")
+        run_id = cursor.lastrowid
+    elif conn.execute("SELECT 1 FROM run WHERE id = ?", (run_id,)).fetchone() is None:
+        raise FetchError(f"No run with id {run_id}.")
 
-    shows = load_shows(conn, user_id)
+    previous_cutoff = db.last_good_cutoff(conn)
+    window = since_timestamp(previous_cutoff) if since is None else since
+    fetch_cutoff = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "UPDATE run SET fetch_cutoff_at = ? WHERE id = ?",
+        (fetch_cutoff, run_id),
+    )
+    conn.commit()
+
+    discovered_count = 0
+    if refresh_discovery:
+        discovery = discover.discover_recent(window)
+        discovered_count = discovery.found
+        discover.save_discovered(conn, discovery.selected)
+        conn.commit()
+        shows = discover.exclude_muted(conn, discovery.selected)
+    else:
+        shows = load_shows(conn)
+
+    result = FetchResult(
+        run_id=run_id,
+        since=window,
+        shows=len(shows),
+        discovered=discovered_count,
+    )
     if not shows:
-        raise FetchError(
-            f"User {user_id} has no active candidate shows. Run Block 2 or the "
-            "onboarding form first — there is nothing to poll."
+        return result
+
+    episodes, result.raw, result.feed_errors = fetch_feeds(shows, window, progress=progress)
+    candidates, result.dropped = filter_episodes(episodes)
+    guids = {episode.guid for episode in candidates}
+    existing: set[str] = set()
+    guid_list = list(guids)
+    for start in range(0, len(guid_list), _CHUNK):
+        batch = guid_list[start : start + _CHUNK]
+        placeholders = ",".join("?" for _ in batch)
+        existing.update(
+            row["guid"]
+            for row in conn.execute(
+                f"SELECT guid FROM episode WHERE guid IN ({placeholders})", batch
+            ).fetchall()
         )
 
-    window = since_timestamp(row["last_run_at"]) if since is None else since
-    result = FetchResult(since=window, shows=len(shows))
-
-    episodes, result.raw, result.feed_errors = fetch_feeds(shows, window)
-    ids = upsert_episodes(conn, episodes)
-    result.stored = len(ids)
-    result.candidates, result.dropped = filter_episodes(conn, user_id, ids)
+    ids = upsert_episodes(conn, candidates)
+    result.stored = len(guids - existing)
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        result.candidates = conn.execute(
+            f"SELECT * FROM episode WHERE id IN ({placeholders}) "
+            "ORDER BY published_at DESC",
+            ids,
+        ).fetchall()
     return result
+
+
+def export_episodes(path: Path, rows: list[sqlite3.Row]) -> int:
+    """Save the exact post-filter pool from this run for human inspection."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = (
+        "guid", "feed_id", "show_name", "title", "description",
+        "duration_sec", "published_at", "web_url",
+    )
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(fields)
+        writer.writerows([[row[field] for field in fields] for row in rows])
+    return len(rows)
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -342,38 +414,59 @@ def fetch_for_user(conn, user_id: int, since: int | None = None) -> FetchResult:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--email", required=True, help="whose shows to poll")
     parser.add_argument(
         "--days",
         type=int,
-        help=f"override the window, ignoring last_run_at (cap {config.MAX_LOOKBACK_DAYS})",
+        help=f"override the last-good cutoff (cap {config.MAX_LOOKBACK_DAYS})",
     )
     parser.add_argument("--show", type=int, default=10, help="how many titles to print")
+    parser.add_argument("--export", type=Path, help="save this run's filtered episodes to CSV")
     args = parser.parse_args()
 
     started = time.time()
-    with db.session() as conn:
-        user = conn.execute(
-            "SELECT id, last_run_at FROM user WHERE email = ?", (args.email,)
-        ).fetchone()
-        if user is None:
-            print(f"No user {args.email}. Subscribe first (Block 3).", file=sys.stderr)
-            return 1
 
+    def show_progress(completed, total, raw, failed):
+        if completed % 100 == 0 or completed == total:
+            print(
+                f"polled {completed}/{total} shows, {raw} raw episodes, "
+                f"{failed} feed errors",
+                flush=True,
+            )
+
+    with db.session() as conn:
+        cursor = conn.execute("INSERT INTO run DEFAULT VALUES")
+        run_id = cursor.lastrowid
         since = since_timestamp(None, max_days=args.days) if args.days else None
-        result = fetch_for_user(conn, user["id"], since=since)
+        try:
+            result = fetch_all(conn, since=since, run_id=run_id, progress=show_progress)
+        except Exception:
+            conn.execute(
+                "UPDATE run SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+                (run_id,),
+            )
+            conn.commit()
+            raise
+        conn.execute(
+            "UPDATE run SET fetched = ?, status = 'ok', "
+            "finished_at = datetime('now') WHERE id = ?",
+            (result.stored, run_id),
+        )
 
     window = datetime.fromtimestamp(result.since, timezone.utc)
     age = (time.time() - result.since) / 86400
     print(
-        f"{result.shows} shows, since {window:%Y-%m-%d %H:%M} UTC "
+        f"{result.discovered} recent category feeds found, {result.shows} selected; "
+        f"since {window:%Y-%m-%d %H:%M} UTC "
         f"({age:.1f}d ago)  [{time.time() - started:.1f}s]"
     )
     if result.feed_errors:
         print(f"warn  {result.feed_errors} feeds failed to respond")
 
     # THE CHECK.
-    print(f"\n{result.raw} raw -> {result.after_filter} after filter")
+    print(
+        f"\n{result.raw} raw -> {result.after_filter} after filter "
+        f"-> {result.stored} new"
+    )
     for reason, count in result.dropped.most_common():
         print(f"  -{count:>5}  {reason}")
 
@@ -383,16 +476,10 @@ def main() -> int:
         print(f"\n  {date}  {mins:>5}  {row['show_name'][:44]}")
         print(f"           {row['title'][:70]}")
 
-    if result.after_filter < 30:
-        print(
-            f"\nSTOP. Only {result.after_filter} candidates. This is a thin pool, and it "
-            "produces bad picks that look exactly like a bad ranker.\n"
-            "Widen the universe first — more terms per interest, or a bigger "
-            "UNIVERSE_TARGET — before touching Block 5."
-        )
-        return 1
-    if result.after_filter < 60:
-        print(f"\nwarn  {result.after_filter} candidates; 60+ is what you want.")
+    if args.export:
+        written = export_episodes(args.export, result.candidates)
+        print(f"\nwrote {written} filtered episodes to {args.export}")
+
     return 0
 
 

@@ -1,0 +1,6 @@
+# Vercel onboarding runtime dependencies. The scheduled pipeline installs the
+# full dependency set from block-1-setup/requirements.txt.
+flask
+libsql
+python-dotenv
+resend

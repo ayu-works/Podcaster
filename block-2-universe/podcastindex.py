@@ -115,9 +115,50 @@ def episodes_by_feed(
     """Episodes for one feed, newest first.
 
     `since` is a unix timestamp; the API returns only episodes published
-    after it. Block 4 passes `user.last_run_at` here.
+    after it. The batched production path passes the last good run cutoff.
     """
     params: dict = {"id": feed_id, "max": max_results}
+    if since is not None:
+        params["since"] = int(since)
+    data = _get("/episodes/byfeedid", params, client)
+    return data.get("items") or []
+
+
+def recent_feeds(
+    since: int,
+    categories: tuple[int, ...],
+    max_results: int | None = None,
+    language: str = "en,unknown",
+    client: httpx.Client | None = None,
+) -> list[dict]:
+    """Recently updated feeds in one or more official catalogue categories."""
+    params = {
+        "since": int(since),
+        "cat": ",".join(str(category) for category in categories),
+        "lang": language,
+        "max": max_results or config.DISCOVERY_RESULTS_PER_TOPIC,
+    }
+    data = _get("/recent/feeds", params, client)
+    return data.get("feeds") or []
+
+
+def episodes_by_feed_ids(
+    feed_ids: list[int],
+    since: int | None = None,
+    max_results: int | None = None,
+    client: httpx.Client | None = None,
+) -> list[dict]:
+    """Episodes for up to 200 feeds in one Podcast Index request."""
+    if not feed_ids:
+        return []
+    if len(feed_ids) > config.EPISODE_FEED_BATCH_SIZE:
+        raise ValueError(
+            f"Podcast Index accepts at most {config.EPISODE_FEED_BATCH_SIZE} feed IDs"
+        )
+    params: dict = {
+        "id": ",".join(str(feed_id) for feed_id in feed_ids),
+        "max": max_results or config.EPISODE_BATCH_MAX_RESULTS,
+    }
     if since is not None:
         params["since"] = int(since)
     data = _get("/episodes/byfeedid", params, client)

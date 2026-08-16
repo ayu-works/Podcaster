@@ -1,167 +1,135 @@
-"""Onboarding: the form, and the universe build it kicks off.
+"""Immediate topic signup, double opt-in, and scanner-safe unsubscribe."""
 
-ARCHITECTURE section 8. Two routes carry the flow — `GET /` renders the form,
-`POST /subscribe` creates the user and starts the build. The build takes ~30
-seconds, so it runs in a thread and `/done/<job>` polls `/status/<job>` rather
-than leaving a blank loading page.
-
-The design rule that matters here: **the free text is the signal.** It goes
-into the ranking prompt word for word and into the search expansion. The chips
-exist only to beat the blank page, so clicking one seeds an editable line in
-the text box instead of becoming an interest in its own right. A chip label
-only ever reaches the database when the user wrote nothing at all — a floor,
-not a feature.
-"""
+from __future__ import annotations
 
 import argparse
 import re
 import secrets
 import threading
 import time
-import traceback
-from dataclasses import dataclass, field
+from collections import defaultdict, deque
 
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+import resend
+from flask import Flask, render_template, request, url_for
 
-from _shared import config, db  # noqa: F401  (sets sys.path for the import below)
-import universe
+from _shared import config, db
 
 app = Flask(__name__)
 
-# ~20 coarse areas. Deliberately broad: they are a prompt for the text box, not
-# a taxonomy. See the module docstring for why they are not interests.
-CHIPS = (
-    "Technology & AI",
-    "Business & Startups",
-    "Design",
-    "Science",
-    "History",
-    "Finance",
-    "Culture",
-    "Politics",
-    "Health & Fitness",
-    "Comedy",
-    "True Crime",
-    "Sport",
-    "Personal Development",
-    "Food & Cooking",
-    "Music",
-    "Film & TV",
-    "Books & Writing",
-    "Philosophy",
-    "Climate & Energy",
-    "Travel",
-)
-
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
-
-# Each interest costs one expansion slot and TERMS_PER_INTEREST searches. Past
-# six the universe stops being about anything in particular.
-MAX_INTERESTS = 6
-MIN_CHIPS_WITHOUT_TEXT = 3
+_SIGNUPS: dict[str, deque[float]] = defaultdict(deque)
+_SIGNUPS_LOCK = threading.Lock()
 
 
-# --- the build job -----------------------------------------------------------
+class ConfirmationEmailError(RuntimeError):
+    """The double-opt-in message could not be handed to Resend."""
 
 
-@dataclass
-class Job:
-    """One in-flight universe build. Lives in memory; a restart forgets it."""
-
-    email: str
-    user_id: int
-    interests: list[str]
-    state: str = "building"  # building | done | failed
-    started_at: float = field(default_factory=time.monotonic)
-    shows: int = 0
-    preview: list[str] = field(default_factory=list)
-    error: str = ""
+def _signup_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    return forwarded or request.remote_addr or "unknown"
 
 
-JOBS: dict[str, Job] = {}
-JOBS_LOCK = threading.Lock()
+def rate_limited(ip: str, now: float | None = None) -> bool:
+    """Small in-process brake; deployment-level controls can replace it later."""
+    now = time.monotonic() if now is None else now
+    cutoff = now - config.SIGNUP_RATE_WINDOW_SEC
+    with _SIGNUPS_LOCK:
+        attempts = _SIGNUPS[ip]
+        while attempts and attempts[0] <= cutoff:
+            attempts.popleft()
+        if len(attempts) >= config.SIGNUP_RATE_LIMIT:
+            return True
+        attempts.append(now)
+        return False
 
 
-def _set(job_id: str, **fields) -> None:
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if job is None:
-            return
-        for key, value in fields.items():
-            setattr(job, key, value)
+def confirmation_url(token: str) -> str:
+    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/confirm/{token}"
 
 
-def run_build(job_id: str) -> None:
-    """Search, rank and persist the candidate universe. Runs off-request.
-
-    Failures are recorded on the job rather than swallowed. A user row with no
-    candidate shows is the one outcome the product cannot recover from on its
-    own, so it has to be visible on the page.
-    """
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-    if job is None:
-        return
-
+def send_confirmation(email: str, token: str) -> str:
+    if not config.RESEND_API_KEY or config.RESEND_API_KEY.startswith("your_"):
+        raise ConfirmationEmailError("RESEND_API_KEY missing from .env")
+    resend.api_key = config.RESEND_API_KEY
+    link = confirmation_url(token)
     try:
-        with db.session() as conn:
-            kept = universe.build(conn, job.user_id, job.interests)
-        _set(
-            job_id,
-            state="done",
-            shows=len(kept),
-            preview=[hit.title for hit in kept[:12]],
+        response = resend.Emails.send(
+            {
+                "from": config.FROM_EMAIL,
+                "to": [email],
+                "subject": "Confirm your Podcaster subscription",
+                "html": (
+                    "<p>Confirm that you want Podcaster's curated episode digest.</p>"
+                    f'<p><a href="{link}">Confirm my subscription</a></p>'
+                    "<p>If you did not request this, ignore this email.</p>"
+                ),
+            }
         )
-    except Exception as exc:  # noqa: BLE001 — reported to the page verbatim
-        traceback.print_exc()
-        _set(job_id, state="failed", error=f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        raise ConfirmationEmailError(f"{type(exc).__name__}: {exc}") from exc
+    if isinstance(response, dict):
+        return response.get("id", "")
+    return getattr(response, "id", "") or ""
 
 
-# --- form handling -----------------------------------------------------------
+def _selected_topics() -> tuple[list[str], str]:
+    submitted = request.form.getlist("topic")
+    unknown = sorted(set(submitted) - set(config.TOPIC_SLUGS))
+    if unknown:
+        return [], "Choose topics from the list shown on this page."
+    selected_set = set(submitted)
+    selected = [slug for slug in config.TOPIC_SLUGS if slug in selected_set]
+    if not selected:
+        return [], "Pick at least one topic."
+    return selected, ""
 
 
-def parse_interests(specifics: str, chips: list[str]) -> list[str]:
-    """One interest per non-empty line of the text box.
+def _save_signup(conn, email: str, topics: list[str]) -> tuple[str, bool]:
+    """Return confirmation token and whether a message must be sent."""
+    row = conn.execute(
+        "SELECT id, status, confirm_token FROM subscriber WHERE email=?", (email,)
+    ).fetchone()
+    if row is None:
+        confirm_token = secrets.token_urlsafe(32)
+        unsub_token = secrets.token_urlsafe(32)
+        while unsub_token == confirm_token:  # defensive; practically impossible
+            unsub_token = secrets.token_urlsafe(32)
+        subscriber_id = conn.execute(
+            "INSERT INTO subscriber (email, unsub_token, confirm_token, status) "
+            "VALUES (?, ?, ?, 'pending')",
+            (email, unsub_token, confirm_token),
+        ).lastrowid
+        needs_confirmation = True
+    else:
+        subscriber_id = row["id"]
+        confirm_token = row["confirm_token"]
+        needs_confirmation = row["status"] != "active"
+        if row["status"] in ("paused", "unsubscribed"):
+            confirm_token = secrets.token_urlsafe(32)
+            unsub_token = secrets.token_urlsafe(32)
+            while unsub_token == confirm_token:
+                unsub_token = secrets.token_urlsafe(32)
+            conn.execute(
+                "UPDATE subscriber SET status='pending', confirmed_at=NULL, "
+                "confirm_token=?, unsub_token=? WHERE id=?",
+                (confirm_token, unsub_token, subscriber_id),
+            )
 
-    Lines still holding nothing but a chip seed ("Design —") are dropped: the
-    user opened the line and did not fill it in, and a bare category label is
-    exactly the abstraction the text box exists to avoid.
-    """
-    seen: set[str] = set()
-    lines: list[str] = []
-    for raw in specifics.splitlines():
-        text = re.sub(r"\s+", " ", raw.strip().lstrip("-•*").strip())
-        text = re.sub(r"[\s\-–—:,]+$", "", text)
-        if len(text) < 3 or text in chips:
-            continue
-        key = text.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        lines.append(text)
-
-    return (lines or chips)[:MAX_INTERESTS]
-
-
-def validate(email: str, interests: list[str], chips: list[str]) -> str:
-    if not EMAIL_RE.match(email):
-        return "That email address does not look right."
-    if not interests:
-        return "Tell us what you want to hear about, in your own words."
-    if not any(text not in chips for text in interests) and len(chips) < MIN_CHIPS_WITHOUT_TEXT:
-        return f"Pick at least {MIN_CHIPS_WITHOUT_TEXT} areas, or write a line of your own."
-    return ""
-
-
-# --- routes ------------------------------------------------------------------
+    conn.execute("DELETE FROM subscription WHERE subscriber_id=?", (subscriber_id,))
+    conn.executemany(
+        "INSERT INTO subscription (subscriber_id, topic) VALUES (?, ?)",
+        [(subscriber_id, topic) for topic in topics],
+    )
+    return confirm_token, needs_confirmation
 
 
 @app.get("/")
 def onboard():
     return render_template(
         "onboard.html",
-        chips=CHIPS,
-        missing_keys=config.missing_keys(2),
+        topics=config.TOPICS,
+        missing_keys=config.missing_keys(6),
         form={},
         error=None,
     )
@@ -169,79 +137,100 @@ def onboard():
 
 @app.post("/subscribe")
 def subscribe():
-    email = request.form.get("email", "").strip()
-    specifics = request.form.get("specifics", "")
-    chips = [c for c in request.form.getlist("chip") if c in CHIPS]
+    # Bots commonly fill every input. Return the ordinary success page so the
+    # field does not reveal itself, but create no row and send no message.
+    if request.form.get("company", "").strip():
+        return render_template(
+            "message.html",
+            title="Check your inbox",
+            message="A confirmation link is on its way. It must be clicked before any digest is sent.",
+        )
 
-    interests = parse_interests(specifics, chips)
-    error = validate(email, interests, chips)
+    if rate_limited(_signup_ip()):
+        return render_template(
+            "message.html",
+            title="Please try again later",
+            message="There have been too many signup attempts from this connection.",
+        ), 429
+
+    email = request.form.get("email", "").strip().lower()
+    topics, topic_error = _selected_topics()
+    error = "" if EMAIL_RE.fullmatch(email) else "That email address does not look right."
+    error = error or topic_error
     if error:
         return (
             render_template(
                 "onboard.html",
-                chips=CHIPS,
-                missing_keys=config.missing_keys(2),
-                form={"email": email, "specifics": specifics, "chips": chips},
+                topics=config.TOPICS,
+                missing_keys=config.missing_keys(6),
+                form={"email": email, "topics": topics},
                 error=error,
             ),
             400,
         )
 
-    # Write the user and their interests synchronously: it takes milliseconds,
-    # and it means a build that fails later still leaves the interests on
-    # record to retry against.
     with db.session() as conn:
-        user_id = universe.ensure_user(conn, email)
-        universe.save_interests(
-            conn, user_id, [universe.Interest(text=text, terms=[]) for text in interests]
+        confirm_token, needs_confirmation = _save_signup(conn, email, topics)
+
+    if needs_confirmation:
+        try:
+            send_confirmation(email, confirm_token)
+        except ConfirmationEmailError:
+            app.logger.exception("confirmation email failed for %s", email)
+            return render_template(
+                "message.html",
+                title="Saved, but email is delayed",
+                message="Your topics are saved. Please try subscribing again in a few minutes to resend confirmation.",
+            ), 503
+        title = "Check your inbox"
+        message = "Click the confirmation link before any podcast digest can be sent."
+    else:
+        title = "Preferences updated"
+        message = "Your new topic selection will be used for the next digest."
+    return render_template("message.html", title=title, message=message)
+
+
+@app.get("/confirm/<token>")
+def confirm(token: str):
+    with db.session() as conn:
+        conn.execute(
+            "UPDATE subscriber SET status='active', "
+            "confirmed_at=COALESCE(confirmed_at, datetime('now')) "
+            "WHERE confirm_token=? AND status IN ('pending', 'active')",
+            (token,),
         )
-
-    job_id = secrets.token_urlsafe(9)
-    with JOBS_LOCK:
-        JOBS[job_id] = Job(email=email, user_id=user_id, interests=interests)
-    threading.Thread(target=run_build, args=(job_id,), daemon=True).start()
-
-    return redirect(url_for("done", job_id=job_id))
-
-
-@app.get("/done/<job_id>")
-def done(job_id: str):
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-    if job is None:
-        return render_template("done.html", job_id=None, job=None), 404
-    return render_template("done.html", job_id=job_id, job=job)
-
-
-@app.get("/status/<job_id>")
-def status(job_id: str):
-    """Polled by the done page. The build has no other way to report itself."""
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-    if job is None:
-        return jsonify({"state": "unknown"}), 404
-    return jsonify(
-        {
-            "state": job.state,
-            "shows": job.shows,
-            "preview": job.preview,
-            "error": job.error,
-            "elapsed": round(time.monotonic() - job.started_at, 1),
-        }
+    return render_template(
+        "message.html",
+        title="Subscription confirmed",
+        message="You're ready. The next strong episodes matching your topics will arrive by email.",
     )
+
+
+@app.get("/unsubscribe/<token>")
+def unsubscribe_prompt(token: str):
+    # GET is deliberately read-only: mail security scanners prefetch links.
+    return render_template("unsubscribe.html", token=token, complete=False)
+
+
+@app.post("/unsubscribe/<token>")
+def unsubscribe(token: str):
+    with db.session() as conn:
+        conn.execute(
+            "UPDATE subscriber SET status='unsubscribed' WHERE unsub_token=?",
+            (token,),
+        )
+    # Identical response for valid, already-used, and unknown tokens.
+    return render_template("unsubscribe.html", token=token, complete=True)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--port", type=int, default=5001)  # 5000 is AirPlay on macOS
+    parser.add_argument("--port", type=int, default=5001)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     db.init_db()
-    missing = config.missing_keys(2)
-    if missing:
-        print(f"warn  {', '.join(missing)} missing from .env — the build will fail")
     print(f"onboarding at http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
     return 0

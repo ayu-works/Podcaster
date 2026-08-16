@@ -1,20 +1,19 @@
-"""Build the ~200-show candidate list for a user.
+"""Build a static reference/fallback show universe.
 
-Podcast Index searches show names, not episode contents, so the expensive
-matching happens once — here, at the show level, where the API is strong.
-Every run afterwards just polls this short list (ARCHITECTURE section 2).
+The scheduled product no longer reads this list: `discover.py` queries recent
+official categories every run. This tool and its CSV remain useful for manual
+catalogue comparisons and as an explicit fallback if the recent-feed endpoint
+ever changes.
 
-**This list is the ceiling on everything the product can ever recommend.**
-If it goes wrong, discovery is permanently capped and nothing downstream
-will tell you. Read it by hand before trusting it — that is the Block 2
-check, and it is the highest-value ten minutes in the build.
-
-One Groq call expands all of the user's verbatim interests into catalogue-style
-search terms. The text remains untouched for the ranker; only the bridge to the
-way podcast shows name themselves is generated.
+The interest list is `config.TOPICS`, not one user's free text — v1's
+per-signup universe build is gone; signup no longer builds anything. One
+Groq call per batch expands topic labels into catalogue-style search terms;
+see INTERESTS_PER_EXPANSION_BATCH below for why 20 topics can't go in one
+call the way v1's three free-text interests did.
 """
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -25,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
-from groq import Groq
+from groq import APIStatusError, Groq, RateLimitError
 
 import podcastindex
 from _shared import config, db
@@ -35,6 +34,43 @@ from _shared import config, db
 # damps the pull of any single term's top hit. 60 is the conventional value.
 RRF_K = 60
 
+# expand_interests() sends every interest it's given in ONE Groq call, and
+# was sized for v1's three free-text interests (3 * TERMS_PER_INTEREST = 54
+# terms), comfortably inside its max_completion_tokens=2500. Twenty topics
+# need 20 * 18 = 360 terms in one response, which will not fit — so this
+# batches, keeping max_completion_tokens=2500 untouched per call.
+#
+# Arithmetic: the response shape is {"index":N,"terms":["term one",...]}.
+# The expansion prompt requires each term to be 1-3 words, so call it up to
+# ~15 tokens/term once quoting, the comma separator and BPE splitting on
+# short catalogue phrases are accounted for — a deliberately generous
+# ceiling, not a measured average, because there's no cheap way to probe
+# actual output size before making the call, and the validator below fails
+# the WHOLE batch if any one interest comes back short. 18 terms/interest *
+# 15 tokens/term = 270 terms tokens, plus ~20 tokens of the
+# {"index":...,"terms":[...]} wrapper itself: ~290 tokens/interest of
+# output. The v1 call was measured with three interests. A live five-topic
+# call failed Groq's server-side JSON validation even with nominal token
+# headroom, so keep the proven three-topic contract rather than trusting
+# arithmetic alone. Twenty topics therefore take seven monthly calls.
+INTERESTS_PER_EXPANSION_BATCH = 3
+
+# Each three-topic batch is roughly 1,500-1,700 tokens all-in. A 20-second
+# pause holds the seven monthly calls near 5,100 tokens/minute, comfortably
+# below GROQ_TPM without a rolling-window rate limiter for this small job.
+EXPANSION_BATCH_PAUSE_SECONDS = 20
+
+# Retry policy for a single batch call, mirroring podcastindex._get(): retry
+# 429s and 5xxs, don't retry anything else (bad JSON, wrong term count, a
+# bad key fail the same way every time, and retrying just pays for the same
+# failure three times). GROQ_TPM is a per-MINUTE ceiling, unlike Podcast
+# Index's per-request one, so backoff needs to be long enough to plausibly
+# clear a minute-scale window rather than podcastindex.py's 1.5s base:
+# 15s/30s/60s across three attempts covers up to ~a minute of waiting for
+# room in the window without padding out an unrelated 5xx blip needlessly.
+GROQ_MAX_RETRIES = 3
+GROQ_BACKOFF_BASE = 15.0  # seconds; 15, 30, 60
+
 
 class UniverseError(RuntimeError):
     """Universe construction could not safely produce a candidate set."""
@@ -42,11 +78,13 @@ class UniverseError(RuntimeError):
 
 @dataclass
 class Interest:
-    """One interest, verbatim, plus the terms used to search for it.
+    """One topic from config.TOPICS, plus the terms used to search for it.
 
-    `text` goes into the ranking prompt word for word — it is the actual
-    signal. `terms` exist only to bridge the gap between how the user talks
-    and what shows call themselves.
+    `text` is the topic label (e.g. "Technology & AI"). There is no per-user
+    free text in v3 — matching happens on the stored `topic` slug, not on
+    this string — so `text` exists only for CLI/log readability and to keep
+    expand_interests()'s existing signature. `terms` bridge the gap between
+    the topic and the way podcast shows actually name themselves.
     """
 
     text: str
@@ -74,30 +112,46 @@ class FeedHit:
         return (time.time() - self.newest_item_pubdate) / 86400
 
 
-# --- interests ---------------------------------------------------------------
+# --- topic terms (optional offline fallback) ---------------------------------
 
 
-def load_interests(path: Path) -> list[Interest]:
-    """Read interest text and optional fallback terms from TOML."""
+def load_topic_terms(path: Path) -> dict[str, list[str]]:
+    """Optional --use-file-terms fallback: search terms keyed by topic slug.
+
+    v1's load_interests() matched fallback terms against free user text,
+    which no longer exists — v3 has no per-user interest, only
+    config.TOPICS. Format:
+
+        [[topic]]
+        slug = "technology-ai"
+        terms = ["term one", "term two", ...]
+
+    Debugging convenience only. The Step 3 check's dry run and the live seed
+    both call expand_interests() for real; this exists so iteration doesn't
+    have to pay for a Groq call every time. Repointing a terms file at
+    config.TOPICS with real per-topic terms is IMPLEMENTATION-PLAN.md Step
+    10's job — until then this raises cleanly on a file with no topic-keyed
+    entries, rather than silently seeding an empty or mismatched universe.
+    """
     if not path.exists():
         raise SystemExit(
-            f"No interests file at {path}.\n"
-            f"Copy {path.parent / 'interests.example.toml'} to {path.name} and edit it."
+            f"No terms file at {path}.\n"
+            f"--use-file-terms needs [[topic]] entries keyed by slug — "
+            f"see load_topic_terms()'s docstring for the format."
         )
     with path.open("rb") as fh:
         data = tomllib.load(fh)
 
-    interests = []
-    for entry in data.get("interest", []):
-        text = (entry.get("text") or "").strip()
-        terms = [t.strip() for t in entry.get("terms", []) if t.strip()]
-        if not text:
-            raise SystemExit("Every [[interest]] needs a non-empty `text`.")
-        interests.append(Interest(text=text, terms=terms))
+    terms_by_slug: dict[str, list[str]] = {}
+    for entry in data.get("topic", []):
+        slug = (entry.get("slug") or "").strip()
+        values = [t.strip() for t in entry.get("terms", []) if t.strip()]
+        if slug:
+            terms_by_slug[slug] = values
+    return terms_by_slug
 
-    if not interests:
-        raise SystemExit("interests.toml has no [[interest]] entries.")
-    return interests
+
+# --- expansion -----------------------------------------------------------------
 
 
 def expand_interests(
@@ -107,7 +161,7 @@ def expand_interests(
 
     Podcast Index searches show titles and descriptions. Short category-like
     phrases work; broad single words and descriptive sentences pull in noisy
-    result tails. The response uses input indexes so the user's wording is
+    result tails. The response uses input indexes so the caller's wording is
     preserved exactly rather than trusted to a model round-trip.
     """
     texts = [text.strip() for text in interest_texts if text.strip()]
@@ -193,6 +247,80 @@ Return only JSON with this shape:
             f"invalid indexes: {invalid}"
         )
     return [Interest(text=text, terms=by_index[index]) for index, text in enumerate(texts)]
+
+
+def _expand_batch_with_retry(texts: list[str], client: Groq) -> list[Interest]:
+    """One batch call, retried on rate limits and server errors only.
+
+    expand_interests() itself never retries — correct for v1, where it made
+    one call per run. A seed now makes several calls back to back, so a
+    single 429 against the real GROQ_TPM ceiling would otherwise kill the
+    whole run for one transient blip. Anything else (malformed JSON, a
+    wrong term count, a bad key) fails the same way on every attempt, so
+    those are not retried — see GROQ_MAX_RETRIES's comment for the backoff
+    reasoning.
+    """
+    last_error: Exception | None = None
+    for attempt in range(GROQ_MAX_RETRIES):
+        try:
+            return expand_interests(texts, client=client)
+        except UniverseError as exc:
+            cause = exc.__cause__
+            retryable = isinstance(cause, RateLimitError) or (
+                isinstance(cause, APIStatusError) and cause.status_code >= 500
+            )
+            if not retryable or attempt == GROQ_MAX_RETRIES - 1:
+                raise
+            last_error = exc
+            retry_after = 0.0
+            if isinstance(cause, APIStatusError):
+                value = cause.response.headers.get("retry-after")
+                try:
+                    retry_after = float(value) if value else 0.0
+                except ValueError:
+                    pass
+            time.sleep(max(retry_after, GROQ_BACKOFF_BASE * (2**attempt)))
+    raise last_error  # pragma: no cover — loop above always returns or raises
+
+
+def expand_all_topics(topic_labels: list[str], client: Groq | None = None) -> list[Interest]:
+    """Batch expand_interests() across every topic in config.TOPICS.
+
+    expand_interests() itself is unchanged — see its docstring — this only
+    calls it several times and stitches the results back together.
+
+    Each call is independently indexed 0..len(batch)-1 by expand_interests()
+    (it echoes back whatever indexes it was given for that call), so a
+    batch's results are mapped back to the caller's GLOBAL topic order by
+    the batch's starting offset, not by re-deriving an index from content.
+    An off-by-one here would silently assign one topic's terms to its
+    neighbour — exactly the class of bug this repo is about — so the
+    per-batch length is checked before the offset mapping is trusted.
+    """
+    if not topic_labels:
+        raise UniverseError("At least one topic is required.")
+    if not config.GROQ_API_KEY and client is None:
+        raise UniverseError("GROQ_API_KEY missing from .env; Block 2 needs it for expansion.")
+
+    groq_client = client or Groq(api_key=config.GROQ_API_KEY)
+    results: list[Interest | None] = [None] * len(topic_labels)
+
+    for start in range(0, len(topic_labels), INTERESTS_PER_EXPANSION_BATCH):
+        batch = topic_labels[start : start + INTERESTS_PER_EXPANSION_BATCH]
+        expanded = _expand_batch_with_retry(batch, groq_client)
+        if len(expanded) != len(batch):
+            raise UniverseError(
+                f"expand_interests returned {len(expanded)} interests for a "
+                f"{len(batch)}-topic batch starting at global index {start}."
+            )
+        for offset, interest in enumerate(expanded):
+            results[start + offset] = interest
+
+        if start + INTERESTS_PER_EXPANSION_BATCH < len(topic_labels):
+            time.sleep(EXPANSION_BATCH_PAUSE_SECONDS)
+
+    assert all(interest is not None for interest in results)
+    return results  # type: ignore[return-value]
 
 
 # --- search and merge --------------------------------------------------------
@@ -358,70 +486,141 @@ def allocate(ranked: list[FeedHit], interest_count: int, target: int) -> list[Fe
 # --- persistence -------------------------------------------------------------
 
 
-def ensure_user(conn, email: str) -> int:
-    row = conn.execute("SELECT id FROM user WHERE email = ?", (email,)).fetchone()
-    if row:
-        return row["id"]
-    cur = conn.execute("INSERT INTO user (email) VALUES (?)", (email,))
-    return cur.lastrowid
+def save_shows(conn, feeds: list[FeedHit]) -> int:
+    """Replace the shared show universe. No user_id — one universe, not N.
 
+    Keeps the legacy seed's safety behaviour without its former user scope:
+    the upsert never touches `status`, so a
+    retained muted show stays muted (S3-12); rows absent from a successful
+    rebuild are deleted, so re-seeding can't grow the universe past its
+    target; and an empty result raises instead of erasing a good universe
+    (S3-11).
 
-def save_interests(conn, user_id: int, interests: list[Interest]) -> None:
-    """Replace the user's interest rows. `text` is what rank.py will read."""
-    conn.execute("DELETE FROM interest WHERE user_id = ?", (user_id,))
-    conn.executemany(
-        "INSERT INTO interest (user_id, text) VALUES (?, ?)",
-        [(user_id, interest.text) for interest in interests],
-    )
-
-
-def save_candidate_shows(conn, user_id: int, feeds: list[FeedHit]) -> int:
-    """Replace a user's universe while preserving retained show statuses.
-
-    Upserts do not touch `status`, so a retained muted show stays muted. Rows
-    absent from the successful rebuild are removed so the universe cannot grow
-    beyond its target. An empty result raises instead of erasing a good list.
+    Also writes show_topic from FeedHit.matched_interests (S3-06).
+    show_topic is coverage/debug data, never used for matching at send time
+    (ARCHITECTURE section 5), so a retained show's topic rows are rebuilt
+    from this run's matches rather than accumulated across seeds — a show
+    that stops matching a topic should stop showing that topic's coverage.
     """
     if not feeds:
-        raise UniverseError("Refusing to replace a candidate universe with an empty list.")
+        raise UniverseError("Refusing to replace the show universe with an empty list.")
 
     conn.executemany(
         """
-        INSERT INTO candidate_show (user_id, feed_id, feed_url, show_name)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT (user_id, feed_id) DO UPDATE SET
-            feed_url  = excluded.feed_url,
-            show_name = excluded.show_name
+        INSERT INTO show (feed_id, feed_url, title)
+        VALUES (?, ?, ?)
+        ON CONFLICT (feed_id) DO UPDATE SET
+            feed_url = excluded.feed_url,
+            title    = excluded.title
         """,
-        [(user_id, f.feed_id, f.feed_url, f.title) for f in feeds],
+        [(f.feed_id, f.feed_url, f.title) for f in feeds],
     )
-    placeholders = ",".join("?" for _ in feeds)
-    conn.execute(
-        f"DELETE FROM candidate_show WHERE user_id = ? "
-        f"AND feed_id NOT IN ({placeholders})",
-        [user_id, *(feed.feed_id for feed in feeds)],
+
+    feed_ids = [f.feed_id for f in feeds]
+    placeholders = ",".join("?" for _ in feed_ids)
+    conn.execute(f"DELETE FROM show WHERE feed_id NOT IN ({placeholders})", feed_ids)
+
+    show_id_by_feed = {
+        row["feed_id"]: row["id"]
+        for row in conn.execute(
+            f"SELECT id, feed_id FROM show WHERE feed_id IN ({placeholders})", feed_ids
+        ).fetchall()
+    }
+
+    show_ids = list(show_id_by_feed.values())
+    id_placeholders = ",".join("?" for _ in show_ids)
+    conn.execute(f"DELETE FROM show_topic WHERE show_id IN ({id_placeholders})", show_ids)
+
+    show_topic_rows = [
+        (show_id_by_feed[f.feed_id], config.TOPIC_SLUGS[index])
+        for f in feeds
+        for index in sorted(f.matched_interests)
+    ]
+    conn.executemany(
+        "INSERT OR IGNORE INTO show_topic (show_id, topic) VALUES (?, ?)",
+        show_topic_rows,
     )
     return len(feeds)
 
 
-def build(
-    conn,
-    user_id: int,
-    interests: list[Interest] | list[str],
-    target: int | None = None,
+def seed_global(
+    target: int,
+    use_file_terms: bool = False,
+    terms_path: Path | None = None,
     groq_client: Groq | None = None,
-) -> list[FeedHit]:
-    """Search, rank, and persist the candidate universe for one user.
-
-    Called by app.py's /subscribe (Block 3) and by the CLI below.
+) -> tuple[list[Interest], list[FeedHit], list[FeedHit], dict[str, int]]:
+    """Expand config.TOPICS, search, rank and allocate — everything short of
+    persistence. Returns (interests, ranked, kept, dropped) so the CLI (and
+    tests) can inspect or export the exact same result whether or not it
+    goes on to write to the database.
     """
-    texts = [item.text if isinstance(item, Interest) else item for item in interests]
-    expanded = expand_interests(texts, client=groq_client)
-    hits = search_all(expanded)
-    ranked, _ = rank_feeds(hits)
-    keep = allocate(ranked, len(expanded), target or config.UNIVERSE_TARGET)
-    save_candidate_shows(conn, user_id, keep)
-    return keep
+    if use_file_terms:
+        term_map = load_topic_terms(terms_path or config.PROJECT_ROOT / "interests.toml")
+        missing = [slug for slug, _ in config.TOPICS if not term_map.get(slug)]
+        if missing:
+            raise UniverseError(f"No fallback terms for: {', '.join(missing)}")
+        interests = [Interest(text=label, terms=term_map[slug]) for slug, label in config.TOPICS]
+    else:
+        interests = expand_all_topics(list(config.TOPIC_LABELS), client=groq_client)
+
+    hits = search_all(interests)
+    ranked, dropped = rank_feeds(hits)
+    keep = allocate(ranked, len(interests), target)
+    return interests, ranked, keep, dropped
+
+
+def export_csv(path: Path, kept: list[FeedHit]) -> int:
+    """Write the resulting universe to CSV: feed_id, title, feed_url, topics.
+
+    `topics` is the matched topic slugs, comma-joined — the same signal
+    show_topic stores, in a form readable without a database. Works
+    identically under --dry-run, so a list can be reviewed before anything
+    is written.
+    """
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["feed_id", "title", "feed_url", "topics"])
+        for hit in kept:
+            slugs = [config.TOPIC_SLUGS[index] for index in sorted(hit.matched_interests)]
+            writer.writerow([hit.feed_id, hit.title, hit.feed_url, ",".join(slugs)])
+    return len(kept)
+
+
+def review_sample(
+    kept: list[FeedHit], topic_count: int = 5, per_topic: int = 10
+) -> list[tuple[int, FeedHit]]:
+    """Choose the Step 3 manual gate: 50 titles spread across five topics.
+
+    Sampling the first 50 allocated rows can accidentally show only the
+    topics with the deepest queues. Pick evenly spaced topic indexes and
+    take each topic's first ten allocated feeds instead, deduplicating a
+    cross-topic show so the reviewer sees 50 distinct titles when coverage
+    permits it.
+    """
+    if topic_count <= 0 or per_topic <= 0:
+        return []
+
+    last_index = len(config.TOPICS) - 1
+    if topic_count == 1:
+        topic_indexes = [0]
+    else:
+        topic_indexes = sorted(
+            {round(position * last_index / (topic_count - 1)) for position in range(topic_count)}
+        )
+
+    sample: list[tuple[int, FeedHit]] = []
+    seen: set[int] = set()
+    for topic_index in topic_indexes:
+        added = 0
+        for hit in kept:
+            if topic_index not in hit.matched_interests or hit.feed_id in seen:
+                continue
+            sample.append((topic_index, hit))
+            seen.add(hit.feed_id)
+            added += 1
+            if added == per_topic:
+                break
+    return sample
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -430,52 +629,54 @@ def build(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
-        "--interests",
-        type=Path,
-        default=config.PROJECT_ROOT / "interests.toml",
-        help="TOML file of interests and search terms",
+        "--seed-global",
+        action="store_true",
+        help="search, rank and persist the shared show universe",
     )
-    parser.add_argument("--email", help="user to build for; created if new")
     parser.add_argument(
-        "--target", type=int, default=config.UNIVERSE_TARGET, help="how many shows to keep"
+        "--target", type=int, default=config.SHOW_TARGET, help="how many shows to keep"
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the list without writing to the database",
+        help="print (and optionally export) without writing to the database",
     )
     parser.add_argument(
         "--use-file-terms",
         action="store_true",
-        help="use optional TOML search terms instead of generating new ones",
+        help="use terms from interests.toml instead of calling Groq (debugging only)",
+    )
+    parser.add_argument(
+        "--export",
+        type=Path,
+        help="write the resulting universe to CSV (feed_id, title, feed_url, topics)",
     )
     args = parser.parse_args()
 
-    if not args.dry_run and not args.email:
-        parser.error("--email is required unless --dry-run is set")
+    if not args.dry_run and not args.seed_global:
+        parser.error("--seed-global is required unless --dry-run is set")
 
-    loaded = load_interests(args.interests)
-    if args.use_file_terms:
-        missing = [interest.text for interest in loaded if not interest.terms]
-        if missing:
-            raise UniverseError(f"No fallback terms for: {', '.join(missing)}")
-        interests = loaded
-    else:
-        print("expanding interests with Groq...", flush=True)
-        interests = expand_interests([interest.text for interest in loaded])
-    term_count = len({t for i in interests for t in i.terms})
-    print(f"{len(interests)} interests, {term_count} unique search terms")
-    for interest in interests:
-        print(f"  {interest.text}: {', '.join(interest.terms)}")
-    print("searching...", flush=True)
+    if not args.use_file_terms:
+        batches = -(-len(config.TOPIC_LABELS) // INTERESTS_PER_EXPANSION_BATCH)
+        print(
+            f"expanding {len(config.TOPIC_LABELS)} topics with Groq "
+            f"({INTERESTS_PER_EXPANSION_BATCH}/batch, {batches} batches)...",
+            flush=True,
+        )
 
     started = time.time()
-    hits = search_all(interests)
-    ranked, dropped = rank_feeds(hits)
-    keep = allocate(ranked, len(interests), args.target)
+    interests, ranked, keep, dropped = seed_global(
+        target=args.target, use_file_terms=args.use_file_terms
+    )
     elapsed = time.time() - started
 
-    print(f"\n{len(hits)} unique feeds found  [{elapsed:.1f}s]")
+    term_count = len({t for i in interests for t in i.terms})
+    print(f"{len(interests)} topics, {term_count} unique search terms")
+    for interest in interests:
+        print(f"  {interest.text}: {', '.join(interest.terms)}")
+    print()
+
+    print(f"{len(ranked) + sum(dropped.values())} unique feeds found  [{elapsed:.1f}s]")
     for reason, count in sorted(dropped.items(), key=lambda kv: -kv[1]):
         print(f"  -{count:>5}  {reason}")
     print(f"  ={len(ranked):>5}  usable, keeping {len(keep)}")
@@ -484,28 +685,36 @@ def main() -> int:
         print(f"    {share:>4}  {interest.text[:60]}")
     print()
 
-    # THE CHECK. Read these names. This list is the ceiling on everything
-    # the product will ever recommend to you.
-    for position, hit in enumerate(keep, 1):
+    # THE CHECK. Read these 50 names across five topics. This list is the
+    # ceiling on everything the product will ever recommend to subscribers.
+    print("manual review sample (up to 10 shows across each of 5 topics):")
+    for position, (topic_index, hit) in enumerate(review_sample(keep), 1):
         age = hit.days_since_episode
         age_text = f"{age:>4.0f}d" if age is not None else "   ?"
-        print(f"{position:>3}. {hit.title[:58]:<58} {age_text}  x{len(hit.matched_terms)}")
+        slugs = ",".join(config.TOPIC_SLUGS[index] for index in sorted(hit.matched_interests))
+        label = config.TOPIC_LABELS[topic_index]
+        print(
+            f"{position:>3}. {label[:20]:<20} {hit.title[:42]:<42} "
+            f"{age_text}  x{len(hit.matched_terms)}  {slugs}"
+        )
 
     if len(keep) < args.target:
         print(
             f"\nwarn  only {len(keep)} of {args.target} shows. Add more search terms "
-            f"per interest, or broaden them slightly, and rerun."
+            f"per topic, or broaden them slightly, and rerun."
         )
+
+    if args.export:
+        written = export_csv(args.export, keep)
+        print(f"\nwrote {written} rows to {args.export}")
 
     if args.dry_run:
         print("\ndry run — nothing written")
         return 0
 
     with db.session() as conn:
-        user_id = ensure_user(conn, args.email)
-        save_interests(conn, user_id, interests)
-        saved = save_candidate_shows(conn, user_id, keep)
-    print(f"\nwrote {saved} candidate_show rows for {args.email} (user {user_id})")
+        saved = save_shows(conn, keep)
+    print(f"\nwrote {saved} show rows")
     return 0
 
 

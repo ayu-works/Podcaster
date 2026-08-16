@@ -48,6 +48,33 @@ TOPICS = (
 TOPIC_SLUGS = tuple(slug for slug, _ in TOPICS)
 TOPIC_LABELS = tuple(label for _, label in TOPICS)
 
+# Podcast Index's official category IDs used for per-run discovery. Categories
+# describe shows, not individual episodes; the tagger remains the authority on
+# what an episode is actually about. Multiple IDs broaden topics whose product
+# label spans several catalogue categories.
+TOPIC_CATEGORIES = {
+    "technology-ai": (102,),
+    "business-startups": (9, 11),
+    "design": (3,),
+    "science": (67, 68, 69, 70, 71, 72, 73, 75),
+    "history": (28,),
+    "finance": (12, 112),
+    "culture": (77, 78),
+    "politics": (58, 59),
+    "health-fitness": (29, 30, 32, 33, 34),
+    "comedy": (16, 17, 18, 19),
+    "true-crime": (103,),
+    "sport": (86,),
+    "personal-development": (25,),
+    "food-cooking": (6,),
+    "music": (53,),
+    "film-tv": (104, 105),
+    "books-writing": (2,),
+    "philosophy": (82,),
+    "climate-energy": (108,),
+    "travel": (83, 84),
+}
+
 # --- Tuning -----------------------------------------------------------------
 
 RELEVANCE_BAR = 70  # the most important number here
@@ -68,14 +95,14 @@ CURATE_MAX_PER_SHOW = 2
 # surface three-week-old episodes as today's picks.
 CURATE_MAX_AGE_DAYS = 7
 
-# Live testing at v1's scale showed fewer terms could not leave 200 fresh
-# feeds for a three-interest profile after staleness and usability filters
-# (block-2-universe/README.md). Not re-verified at 20 topics / SHOW_TARGET
-# scale — Step 10 calls for re-measuring there.
+# Reference/fallback static-seed settings. The scheduled flow does not expand
+# terms or poll this saved universe; dynamic recent-category settings are below.
 TERMS_PER_INTEREST = 18
 
 TAG_BATCH_SIZE = 20  # episodes per tagging call
 TAG_MAX_TOPICS = 3  # topics one episode may carry
+TAG_COMPLETION_TOKENS = 2_500  # reasoning plus JSON for one batch
+TAG_REASONING_EFFORT = "medium"
 
 # Then abandon; without a cap, an episode whose description reliably produces
 # a generic why-line is retried on every run, forever, at cost, while looking
@@ -119,26 +146,36 @@ EPISODES_PER_FEED = 25
 # with no code change.
 GROQ_TPM = 8_000
 
-# Groq free-tier tokens-per-day for GROQ_MODEL. This, not GROQ_TPM, is the
-# binding constraint on the whole product's reach — see ARCHITECTURE section
-# 9. It sets SHOW_TARGET below: after reserving headroom for retries and the
-# monthly seed, ~170,000 usable tokens/day at ~220 tokens/episode caps tagging
-# at ~770 episodes per run.
+# Groq free-tier tokens-per-day for GROQ_MODEL. This, not GROQ_TPM, bounds the
+# dynamically selected episode pool; see ARCHITECTURE section 9.
 GROQ_TPD = 200_000
 
-# DERIVED from GROQ_TPD, not chosen freely — see ARCHITECTURE section 9
-# before raising this. Shows publish roughly every 3 to 4 days, so a 2-day
-# run sees new episodes from about a third of the universe; ~770 taggable
-# episodes/run x 3 is ~2,300, hence 2,500 and not 5,000. Raising SHOW_TARGET
-# without raising the Groq tier silently truncates coverage, because episodes
-# still get fetched but never get tagged.
+# Reference target used only by universe.py and the saved comparison CSV.
 SHOW_TARGET = 2_500
+
+# Dynamic discovery replaces polling SHOW_TARGET one feed at a time. Ask the
+# catalogue for its full per-topic window, then round-robin down to what the
+# daily tagging budget can cover. The first live one-day run measured 1,866
+# episodes from 700 feeds, then 872 filtered episodes from a balanced 280-feed
+# run (3.11/feed). A 240-feed cap projects to ~747 episodes, leaving retry
+# headroom inside the ~770 episode/day Groq ceiling.
+DISCOVERY_RESULTS_PER_TOPIC = 1_000
+DISCOVERY_FEED_TARGET = 240
+DISCOVERY_WORKERS = 4
+
+# Podcast Index accepts at most 200 comma-separated IDs per episode request.
+# `max` is total results for the request, so 1,000 leaves headroom for several
+# episodes from daily shows without returning unbounded history.
+EPISODE_FEED_BATCH_SIZE = 200
+EPISODE_BATCH_MAX_RESULTS = 1_000
+FETCH_BATCH_WORKERS = 3
 
 # --- Paths ------------------------------------------------------------------
 
 DB_PATH = PROJECT_ROOT / "podcaster.db"
 LOG_DIR = PROJECT_ROOT / "logs"
 RANK_LOG_PATH = LOG_DIR / "rank.log"  # every prompt and response, Block 5
+TAG_LOG_PATH = LOG_DIR / "tag.log"  # every tagging prompt and raw response
 RUN_LOG_PATH = LOG_DIR / "runs.jsonl"  # one line per run, ARCHITECTURE s10
 
 # --- Secrets ----------------------------------------------------------------
@@ -147,7 +184,13 @@ PODCASTINDEX_KEY = os.getenv("PODCASTINDEX_KEY", "")
 PODCASTINDEX_SECRET = os.getenv("PODCASTINDEX_SECRET", "")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 
-FROM_EMAIL = os.getenv("FROM_EMAIL", "onboarding@resend.dev")
+FROM_EMAIL = os.getenv("FROM_EMAIL") or "onboarding@resend.dev"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL") or "http://127.0.0.1:5001"
+
+# A light public-form brake. This is deliberately small and in-process; it
+# complements the honeypot without pretending to be a distributed firewall.
+SIGNUP_RATE_LIMIT = 5
+SIGNUP_RATE_WINDOW_SEC = 60 * 60
 
 # --- The ranker's model -----------------------------------------------------
 

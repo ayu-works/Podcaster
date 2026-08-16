@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Unsubscribe — Podcaster{% endblock %}
+{% block content %}
+<p class="eyebrow">Podcaster</p>
+{% if complete %}
+<h1>You're unsubscribed.</h1>
+<p class="lede">No more digests will be sent. This request is safe to repeat.</p>
+{% else %}
+<h1>Stop receiving Podcaster?</h1>
+<p class="lede">This removes this email address from future digests.</p>
+<form method="post" action="{{ url_for('unsubscribe', token=token) }}">
+  <button class="go flush" type="submit">Yes, unsubscribe</button>
+</form>
+{% endif %}
+{% endblock %}

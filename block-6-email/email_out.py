@@ -1,68 +1,68 @@
-"""Render the digest and send it (ARCHITECTURE section 6, stage 4).
+"""Render and deliver this run's shared picks to active subscribers."""
 
-**The digest rows are written before the send and marked afterwards.** A send
-that fails after the API accepted it would otherwise vanish: no record, no way
-to tell it from a quiet day, and the same episodes offered again next run.
-
-That gives `digest.kind` four states rather than two:
-
-| kind | meaning | counts as already-sent? |
-|---|---|---|
-| `sent` | delivered | yes |
-| `quiet` | nothing cleared the bar | n/a, has no items |
-| `pending` | written, outcome unknown | **yes** — assume it arrived |
-| `failed` | the API rejected it outright | no, offer them again |
-
-`pending` is deliberately conservative. Sending the same episode twice is the
-single thing most likely to make this feel broken, so an unknown outcome is
-treated as delivered.
-
-The module is `email_out.py`, not `email.py`: `email` is in the standard
-library and shadowing it breaks any dependency that imports it.
-"""
+from __future__ import annotations
 
 import argparse
 import sys
 import webbrowser
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import resend
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from _shared import config, db
-import fetch as fetch_mod
-import rank as rank_mod
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 
 class EmailError(RuntimeError):
-    """Delivery could not be attempted or was rejected."""
+    """A recipient's delivery attempt was rejected."""
 
 
 @dataclass
 class Delivery:
-    kind: str  # sent | quiet | failed | skipped
-    digest_id: int | None = None
+    subscriber_id: int
+    email: str
+    kind: str  # sent | failed | skipped | preview
+    episode_ids: list[int] = field(default_factory=list)
     message_id: str = ""
     subject: str = ""
     html: str = ""
     error: str = ""
 
 
-# --- rendering ---------------------------------------------------------------
+@dataclass
+class DeliveryResult:
+    deliveries: list[Delivery] = field(default_factory=list)
 
-# Autoescape is on: titles and descriptions come from arbitrary RSS feeds, and
-# a feed that puts markup in an episode title should not get to write HTML into
-# the email.
+    @property
+    def sent(self) -> int:
+        return sum(item.kind == "sent" for item in self.deliveries)
+
+    @property
+    def failed(self) -> int:
+        return sum(item.kind == "failed" for item in self.deliveries)
+
+    @property
+    def skipped(self) -> int:
+        return sum(item.kind == "skipped" for item in self.deliveries)
+
+
 _env = Environment(
     loader=FileSystemLoader(TEMPLATE_DIR),
     autoescape=select_autoescape(["html"]),
     trim_blocks=True,
     lstrip_blocks=True,
 )
+
+
+def format_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "?"
+    return f"{round(seconds / 60)}m"
 
 
 def _pretty_date(value: str | None) -> str:
@@ -74,61 +74,76 @@ def _pretty_date(value: str | None) -> str:
         return value[:10]
 
 
-def render(picks: list, scanned: int, shows: int) -> str:
-    items = [
-        {
-            "episode": pick.episode,
-            "reason": pick.reason,
-            "score": pick.score,
-            "duration": rank_mod.format_duration(pick.episode["duration_sec"]),
-            "published": _pretty_date(pick.episode["published_at"]),
+def load_picks(conn, subscriber_id: int, run_id: int) -> list[dict]:
+    """Merge subscribed topics, dedupe, and enforce whole-email caps."""
+    rows = conn.execute(
+        """
+        SELECT dp.topic, dp.rank, e.*
+        FROM subscription sub
+        JOIN daily_pick dp ON dp.topic = sub.topic AND dp.run_id = ?
+        JOIN episode e ON e.id = dp.episode_id
+        LEFT JOIN sent s
+          ON s.subscriber_id = sub.subscriber_id AND s.episode_id = e.id
+        WHERE sub.subscriber_id = ?
+          AND (s.status IS NULL OR s.status = 'failed')
+        ORDER BY e.score DESC, dp.rank, e.published_at DESC
+        """,
+        (run_id, subscriber_id),
+    ).fetchall()
+
+    selected: list[dict] = []
+    seen_episodes: set[int] = set()
+    show_counts: Counter = Counter()
+    for row in rows:
+        if row["id"] in seen_episodes:
+            continue
+        if show_counts[row["feed_id"]] >= config.MAX_PER_SHOW_PER_EMAIL:
+            continue
+        seen_episodes.add(row["id"])
+        show_counts[row["feed_id"]] += 1
+        selected.append(dict(row))
+        if len(selected) == config.MAX_PER_EMAIL:
+            break
+    return selected
+
+
+def unsubscribe_url(token: str) -> str:
+    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/unsubscribe/{token}"
+
+
+def render(picks: list[dict], token: str) -> str:
+    groups: list[dict] = []
+    by_topic: dict[str, list[dict]] = {}
+    labels = dict(config.TOPICS)
+    for pick in picks:
+        item = {
+            "episode": pick,
+            "reason": pick["why"],
+            "duration": format_duration(pick["duration_sec"]),
+            "published": _pretty_date(pick["published_at"]),
         }
-        for pick in picks
-    ]
+        by_topic.setdefault(pick["topic"], []).append(item)
+    for slug, items in by_topic.items():
+        groups.append({"slug": slug, "label": labels[slug], "items": items})
     return _env.get_template("digest.html").render(
-        picks=items,
-        scanned=scanned,
-        shows=shows,
+        groups=groups,
+        pick_count=len(picks),
         sent_on=datetime.now().strftime("%A %-d %B"),
+        unsubscribe_url=unsubscribe_url(token),
     )
 
 
-def subject_line(picks: list) -> str:
-    """The episode's own title. Nothing summarises it better, and a subject
-    that names the thing is what makes an unopened digest worth opening."""
-    title = picks[0].episode["title"]
+def subject_line(picks: list[dict]) -> str:
+    title = picks[0]["title"]
     if len(title) > 68:
         title = title[:67].rstrip() + "…"
     return title + (f"  (+{len(picks) - 1} more)" if len(picks) > 1 else "")
 
 
-# --- persistence -------------------------------------------------------------
-
-
-def write_digest(conn, user_id: int, picks: list, kind: str) -> int:
-    cursor = conn.execute(
-        "INSERT INTO digest (user_id, kind) VALUES (?, ?)", (user_id, kind)
-    )
-    digest_id = cursor.lastrowid
-    if picks:
-        conn.executemany(
-            "INSERT INTO digest_item (digest_id, episode_id, score, reason_text) "
-            "VALUES (?, ?, ?, ?)",
-            [(digest_id, p.episode["id"], p.score, p.reason) for p in picks],
-        )
-    return digest_id
-
-
-def mark(conn, digest_id: int, kind: str) -> None:
-    conn.execute("UPDATE digest SET kind = ? WHERE id = ?", (kind, digest_id))
-
-
-# --- sending -----------------------------------------------------------------
-
-
-def send(to: str, subject: str, html: str) -> str:
+def send(to: str, subject: str, html: str, token: str) -> str:
     if not config.RESEND_API_KEY or config.RESEND_API_KEY.startswith("your_"):
-        raise EmailError("RESEND_API_KEY missing from .env; Block 6 cannot send.")
+        raise EmailError("RESEND_API_KEY missing from .env")
+    url = unsubscribe_url(token)
     resend.api_key = config.RESEND_API_KEY
     try:
         response = resend.Emails.send(
@@ -137,108 +152,146 @@ def send(to: str, subject: str, html: str) -> str:
                 "to": [to],
                 "subject": subject,
                 "html": html,
+                "headers": {
+                    "List-Unsubscribe": f"<{url}>",
+                    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+                },
             }
         )
-    except Exception as exc:  # noqa: BLE001 — surfaced to the caller as a failure
+    except Exception as exc:
         raise EmailError(f"{type(exc).__name__}: {exc}") from exc
-    return (response or {}).get("id", "")
+    if isinstance(response, dict):
+        return response.get("id", "")
+    return getattr(response, "id", "") or ""
 
 
-def deliver(conn, user_id: int, result, fetched, dry_run: bool = False) -> Delivery:
-    """Record, then send, then mark. Never the other way around."""
-    user = conn.execute("SELECT email FROM user WHERE id = ?", (user_id,)).fetchone()
-    if user is None:
-        raise EmailError(f"No user with id {user_id}.")
+def _record_pending(conn, subscriber_id: int, run_id: int, episode_ids: list[int]) -> None:
+    conn.executemany(
+        """
+        INSERT INTO sent (subscriber_id, episode_id, run_id, status, attempts)
+        VALUES (?, ?, ?, 'pending', 1)
+        ON CONFLICT (subscriber_id, episode_id) DO UPDATE SET
+            run_id = excluded.run_id,
+            status = 'pending',
+            attempts = sent.attempts + 1,
+            last_error = NULL,
+            sent_at = NULL
+        """,
+        [(subscriber_id, episode_id, run_id) for episode_id in episode_ids],
+    )
+    conn.commit()
 
-    if not result.picks:
-        # A failed ranking call and a genuinely quiet day both produce no picks.
-        # Recording the second as the first would corrupt the one metric that
-        # tells you the pipeline is alive (ARCHITECTURE section 10).
-        if not result.trustworthy:
-            return Delivery(kind="skipped", error=result.error or "ranking failed")
-        digest_id = None if dry_run else write_digest(conn, user_id, [], "quiet")
-        return Delivery(kind="quiet", digest_id=digest_id)
 
-    html = render(result.picks, fetched.after_filter, fetched.shows)
-    subject = subject_line(result.picks)
+def _mark(conn, subscriber_id: int, episode_ids: list[int], status: str, error: str | None = None):
+    conn.executemany(
+        "UPDATE sent SET status=?, last_error=?, "
+        "sent_at=CASE WHEN ?='sent' THEN datetime('now') ELSE NULL END "
+        "WHERE subscriber_id=? AND episode_id=?",
+        [
+            (status, error, status, subscriber_id, episode_id)
+            for episode_id in episode_ids
+        ],
+    )
+    conn.commit()
+
+
+def deliver_subscriber(conn, subscriber, run_id: int, dry_run: bool = False) -> Delivery:
+    picks = load_picks(conn, subscriber["id"], run_id)
+    if not picks:
+        return Delivery(subscriber["id"], subscriber["email"], "skipped")
+
+    html = render(picks, subscriber["unsub_token"])
+    subject = subject_line(picks)
+    episode_ids = [pick["id"] for pick in picks]
     if dry_run:
-        return Delivery(kind="skipped", subject=subject, html=html)
-
-    digest_id = write_digest(conn, user_id, result.picks, "pending")
-    conn.commit()  # the record must outlive a crash inside send()
-
-    try:
-        message_id = send(user["email"], subject, html)
-    except EmailError as exc:
-        mark(conn, digest_id, "failed")
         return Delivery(
-            kind="failed", digest_id=digest_id, subject=subject, html=html, error=str(exc)
+            subscriber["id"], subscriber["email"], "preview",
+            episode_ids, subject=subject, html=html,
         )
 
-    mark(conn, digest_id, "sent")
+    _record_pending(conn, subscriber["id"], run_id, episode_ids)
+    try:
+        message_id = send(
+            subscriber["email"], subject, html, subscriber["unsub_token"]
+        )
+    except EmailError as exc:
+        _mark(conn, subscriber["id"], episode_ids, "failed", str(exc))
+        return Delivery(
+            subscriber["id"], subscriber["email"], "failed", episode_ids,
+            subject=subject, html=html, error=str(exc),
+        )
+
+    _mark(conn, subscriber["id"], episode_ids, "sent")
     return Delivery(
-        kind="sent", digest_id=digest_id, message_id=message_id, subject=subject, html=html
+        subscriber["id"], subscriber["email"], "sent", episode_ids,
+        message_id=message_id, subject=subject, html=html,
     )
 
 
-# --- CLI ---------------------------------------------------------------------
+def deliver_all(conn, run_id: int, dry_run: bool = False) -> DeliveryResult:
+    subscribers = conn.execute(
+        "SELECT id, email, unsub_token FROM subscriber "
+        "WHERE status='active' ORDER BY id"
+    ).fetchall()
+    result = DeliveryResult()
+    for subscriber in subscribers:
+        # External send errors become a failed Delivery inside
+        # deliver_subscriber. This outer guard also isolates an unexpected
+        # recipient-specific render or database problem from later recipients.
+        try:
+            delivery = deliver_subscriber(conn, subscriber, run_id, dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001 -- isolation is the contract
+            conn.rollback()
+            delivery = Delivery(
+                subscriber["id"], subscriber["email"], "failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        result.deliveries.append(delivery)
+    return result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--email", required=True)
-    parser.add_argument(
-        "--dry-run", action="store_true", help="render to a file, send nothing"
-    )
-    parser.add_argument("--open", action="store_true", help="open the dry-run render")
+    parser.add_argument("--run-id", type=int)
+    parser.add_argument("--email")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
 
     with db.session() as conn:
-        user = conn.execute(
-            "SELECT id, email FROM user WHERE email = ?", (args.email,)
-        ).fetchone()
-        if user is None:
-            print(f"No user {args.email}. Subscribe first (Block 3).", file=sys.stderr)
-            return 1
+        run_id = args.run_id
+        if run_id is None:
+            row = conn.execute("SELECT id FROM run ORDER BY id DESC LIMIT 1").fetchone()
+            if row is None:
+                print("No run exists", file=sys.stderr)
+                return 1
+            run_id = row["id"]
+        if args.email:
+            subscribers = conn.execute(
+                "SELECT id, email, unsub_token FROM subscriber "
+                "WHERE email=? AND status='active'",
+                (args.email,),
+            ).fetchall()
+            result = DeliveryResult(
+                [deliver_subscriber(conn, row, run_id, args.dry_run) for row in subscribers]
+            )
+        else:
+            result = deliver_all(conn, run_id, args.dry_run)
 
-        fetched = fetch_mod.fetch_for_user(conn, user["id"])
-        print(f"{fetched.raw} raw -> {fetched.after_filter} after filter")
-
-        result = rank_mod.rank(conn, user["id"], fetched.candidates)
-        print(
-            f"ranked {result.ranked} of {result.candidates}, "
-            f"cleared bar {result.cleared_bar}, picks {len(result.picks)}"
-        )
-
-        delivery = deliver(conn, user["id"], result, fetched, dry_run=args.dry_run)
-
-    if delivery.kind == "quiet":
-        print("quiet — nothing cleared the bar, nothing sent. Recorded as a quiet digest.")
-        return 0
-    if delivery.kind == "skipped" and not delivery.html:
-        print(f"NOT sent and NOT recorded quiet: {delivery.error}", file=sys.stderr)
-        return 1
-    if delivery.kind == "failed":
-        print(f"send failed: {delivery.error}", file=sys.stderr)
-        print("digest recorded as 'failed'; those episodes stay eligible.")
-        return 1
-
-    for pick in result.picks:
-        print(f"  {pick.score:>3}  {pick.episode['show_name'][:44]} — {pick.episode['title'][:44]}")
-
-    if args.dry_run:
+    print(
+        f"run {run_id}: sent {result.sent}, failed {result.failed}, "
+        f"skipped {result.skipped}, previews "
+        f"{sum(item.kind == 'preview' for item in result.deliveries)}"
+    )
+    previews = [item for item in result.deliveries if item.kind == "preview"]
+    if previews:
         out = config.LOG_DIR / "digest-preview.html"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(delivery.html, encoding="utf-8")
-        print(f"\nsubject: {delivery.subject}")
-        print(f"{len(delivery.html) / 1024:.1f}KB written to {out}  (Gmail clips at 102KB)")
+        out.write_text(previews[0].html, encoding="utf-8")
+        print(f"preview: {out}")
         if args.open:
             webbrowser.open(out.as_uri())
-        return 0
-
-    print(f"\nsent to {user['email']}  (subject: {delivery.subject})")
-    print(f"resend id: {delivery.message_id}")
-    return 0
+    return 1 if result.failed else 0
 
 
 if __name__ == "__main__":

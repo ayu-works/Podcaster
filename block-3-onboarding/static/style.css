@@ -1,5 +1,4 @@
-/* Onboarding. One column, one accent, the text box as the loudest element on
-   the page — because it is the only input that actually reaches the ranker. */
+/* Onboarding. One column, one accent, and twenty compact topic controls. */
 
 :root {
   --bg: #0c0b0f;
@@ -92,6 +91,11 @@ h1 {
   margin-bottom: 40px;
 }
 
+fieldset.field {
+  padding: 0;
+  border: 0;
+}
+
 /* --- chips ---------------------------------------------------------------- */
 
 .chips {
@@ -144,7 +148,6 @@ h1 {
 
 /* --- inputs --------------------------------------------------------------- */
 
-textarea,
 input[type="email"] {
   display: block;
   width: calc(100% - 22px);
@@ -158,19 +161,10 @@ input[type="email"] {
   transition: border-color 0.14s, background 0.14s;
 }
 
-textarea {
-  min-height: 148px;
-  resize: none;
-  overflow: hidden;
-  line-height: 1.7;
-}
-
-textarea::placeholder,
 input::placeholder {
   color: var(--ink-faint);
 }
 
-textarea:focus,
 input[type="email"]:focus {
   outline: none;
   border-color: var(--accent);
@@ -204,6 +198,18 @@ button.go:hover:not(:disabled) {
 button.go:disabled {
   opacity: 0.34;
   cursor: not-allowed;
+}
+
+button.go.flush {
+  margin-left: 0;
+}
+
+.trap {
+  position: absolute;
+  left: -10000px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
 }
 
 .foot {

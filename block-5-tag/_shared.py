@@ -1,9 +1,4 @@
-"""Import shim: Block 1's config and db, Block 2's API client, Block 4's fetch.
-
-This folder comes first on `sys.path`, so its `_shared` shadows the ones in the
-other blocks. `config` and `db` are bound here before anything imports them.
-Import `fetch` and `podcastindex` from the caller, not from this file.
-"""
+"""Import shim for setup, universe and fetch blocks."""
 
 import pathlib
 import sys
