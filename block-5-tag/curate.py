@@ -114,6 +114,80 @@ def curate(
     return result
 
 
+def curate_short(
+    conn,
+    run_id: int,
+    episode_ids: list[int],
+    topics: tuple[str, ...],
+    limit: int = 2,
+    now: datetime | None = None,
+) -> CurateResult:
+    """Curate one tiny targeted email with bounded remote DB round trips.
+
+    The production curator intentionally builds all 20 shared topic lists.
+    A real smoke run needs only the target subscriber's topics and two unique
+    episodes, so looping over every topic wastes most of its time budget.
+    """
+    if conn.execute("SELECT 1 FROM run WHERE id=?", (run_id,)).fetchone() is None:
+        raise CurateError(f"No run with id {run_id}")
+    result = CurateResult(run_id=run_id)
+    conn.execute("DELETE FROM daily_pick WHERE run_id=?", (run_id,))
+    if not episode_ids or not topics:
+        return result
+    if limit < 1:
+        raise ValueError("short curation limit must be positive")
+
+    clock = now or datetime.now(timezone.utc)
+    staleness_floor = _timestamp(
+        clock - timedelta(days=config.CURATE_MAX_AGE_DAYS)
+    )
+    episode_placeholders = ",".join("?" for _ in episode_ids)
+    topic_placeholders = ",".join("?" for _ in topics)
+    rows = conn.execute(
+        f"""
+        SELECT e.*, t.topic
+        FROM episode e
+        JOIN episode_topic t ON t.episode_id=e.id
+        WHERE e.id IN ({episode_placeholders})
+          AND t.topic IN ({topic_placeholders})
+          AND e.tagged_at IS NOT NULL
+          AND e.published_at > ?
+          AND NOT EXISTS (
+              SELECT 1 FROM daily_pick prior
+              WHERE prior.episode_id=e.id AND prior.run_id<>?
+          )
+        ORDER BY e.score DESC, e.published_at DESC, t.topic
+        """,
+        (*episode_ids, *topics, staleness_floor, run_id),
+    ).fetchall()
+
+    selected = []
+    seen_episodes: set[int] = set()
+    show_counts: Counter = Counter()
+    for row in rows:
+        if row["id"] in seen_episodes:
+            continue
+        if show_counts[row["feed_id"]] >= config.CURATE_MAX_PER_SHOW:
+            result.dropped_same_show += 1
+            continue
+        seen_episodes.add(row["id"])
+        show_counts[row["feed_id"]] += 1
+        selected.append(row)
+        if len(selected) == limit:
+            break
+
+    db.execute_values(
+        conn,
+        "INSERT INTO daily_pick (run_id, topic, episode_id, rank) VALUES {values}",
+        [
+            (run_id, row["topic"], row["id"], rank)
+            for rank, row in enumerate(selected, 1)
+        ],
+    )
+    result.counts_by_topic.update(Counter(row["topic"] for row in selected))
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--run-id", type=int)

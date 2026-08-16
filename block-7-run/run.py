@@ -218,13 +218,20 @@ def execute(
 
         stage = "curate"
         print(f"stage={stage} start", flush=True)
-        curate_options = {"previous_cutoff": previous_cutoff}
         if short_digest:
-            curate_options.update(
-                eligible_episode_ids=short_episode_ids,
-                min_score=0,
+            curated = curate.curate_short(
+                conn,
+                run_id,
+                short_episode_ids or [],
+                short_topics or (),
+                limit=config.SHORT_EMAIL_LIMIT,
             )
-        curated = curate.curate(conn, run_id, **curate_options)
+        else:
+            curated = curate.curate(
+                conn,
+                run_id,
+                previous_cutoff=previous_cutoff,
+            )
         metrics.picks_by_topic = curated.counts_by_topic
         conn.commit()
         print(

@@ -143,6 +143,44 @@ class CurateTests(unittest.TestCase):
         self.assertEqual(current_count, 1)
         self.assertEqual(next_result.counts_by_topic["technology-ai"], 0)
 
+    def test_short_curator_selects_two_unique_subscriber_topic_episodes(self):
+        with db.session(self.path) as conn:
+            first = self.add_episode(
+                conn,
+                "first",
+                40,
+                feed_id=1,
+                topics=("design", "science"),
+            )
+            second = self.add_episode(
+                conn,
+                "second",
+                30,
+                feed_id=2,
+                topics=("history",),
+            )
+            unrelated = self.add_episode(
+                conn,
+                "unrelated",
+                100,
+                feed_id=3,
+                topics=("finance",),
+            )
+            result = curate.curate_short(
+                conn,
+                self.run_id,
+                [first, second, unrelated],
+                ("design", "science", "history"),
+                limit=2,
+                now=NOW,
+            )
+            rows = conn.execute(
+                "SELECT episode_id FROM daily_pick WHERE run_id=? ORDER BY rank",
+                (self.run_id,),
+            ).fetchall()
+        self.assertEqual([row[0] for row in rows], [first, second])
+        self.assertEqual(result.total, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

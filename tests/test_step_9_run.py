@@ -316,8 +316,12 @@ class RunTests(unittest.TestCase):
                 self.short_tag_options = kwargs
                 return self.tag_result()
 
-            def curate_short(target, run_id, **kwargs):
-                self.short_curate_options = kwargs
+            def curate_short(target, run_id, episode_ids, topics, **kwargs):
+                self.short_curate_options = {
+                    "episode_ids": episode_ids,
+                    "topics": topics,
+                    **kwargs,
+                }
                 return SimpleNamespace(counts_by_topic={"science": 2})
 
             def send_short(target, run_id, **kwargs):
@@ -326,7 +330,7 @@ class RunTests(unittest.TestCase):
 
             with patch.object(pipeline.fetch, "fetch_all", side_effect=fetch_short), patch.object(
                 pipeline.tag, "tag_all", side_effect=tag_short
-            ), patch.object(pipeline.curate, "curate", side_effect=curate_short), patch.object(
+            ), patch.object(pipeline.curate, "curate_short", side_effect=curate_short), patch.object(
                 pipeline.email_out, "deliver_all", side_effect=send_short
             ):
                 metrics = pipeline.execute(
@@ -344,8 +348,12 @@ class RunTests(unittest.TestCase):
         )
         self.assertEqual(self.short_tag_options["episode_ids"], list(range(1, 11)))
         self.assertEqual(self.short_tag_options["limit"], 10)
-        self.assertEqual(self.short_curate_options["eligible_episode_ids"], list(range(1, 11)))
-        self.assertEqual(self.short_curate_options["min_score"], 0)
+        self.assertEqual(self.short_curate_options["episode_ids"], list(range(1, 11)))
+        self.assertEqual(
+            self.short_curate_options["topics"],
+            ("design", "history", "science"),
+        )
+        self.assertEqual(self.short_curate_options["limit"], 2)
         self.assertEqual(self.short_send_options["max_picks"], 2)
         self.assertEqual(self.short_send_options["min_picks"], 2)
 
