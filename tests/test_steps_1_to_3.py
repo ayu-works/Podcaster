@@ -136,7 +136,7 @@ class SchemaTests(unittest.TestCase):
 
         fake_driver = SimpleNamespace(connect=fake_connect, Row=FakeRow)
         with patch.dict(sys.modules, {"turso_serverless": fake_driver}):
-            conn = db.connect("libsql://podcaster.example", token="token")
+            conn = db.connect("  libsql://podcaster.example\n", token="token\n")
 
         self.assertEqual(calls, [("libsql://podcaster.example", "token")])
         row = conn.execute("SELECT 1 AS one").fetchone()

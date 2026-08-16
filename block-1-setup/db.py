@@ -216,15 +216,18 @@ def connect(url=None, token=None):
     driver unnecessarily.
     """
     url = config.DATABASE_URL if url is None else url
+    if isinstance(url, str):
+        url = url.strip()
 
     if isinstance(url, str) and (
         url.startswith("libsql://") or url.startswith("https://")
     ):
         import turso_serverless  # noqa: local import, see docstring
 
-        conn = turso_serverless.connect(
-            url, auth_token=token or config.DATABASE_TOKEN
-        )
+        auth_token = token or config.DATABASE_TOKEN
+        if isinstance(auth_token, str):
+            auth_token = auth_token.strip()
+        conn = turso_serverless.connect(url, auth_token=auth_token)
         # The serverless driver implements the DB-API row_factory contract
         # and ships its own sqlite3.Row-compatible Row type. Downstream code
         # intentionally uses both positional and named access, plus dict(row).
