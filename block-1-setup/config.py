@@ -16,15 +16,72 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 load_dotenv(PROJECT_ROOT / ".env")
 
+# --- Topics -------------------------------------------------------------------
+
+# The single source for show seeding, the tagging prompt's allowed slugs,
+# curation, and the onboarding checkboxes (ARCHITECTURE section 9). Do not
+# copy this list anywhere else — four copies is four chances to drift. Order
+# matches the allowed-slug list hardcoded into the tagging prompt in
+# ARCHITECTURE section 6, stage 2.
+TOPICS = (
+    ("technology-ai", "Technology & AI"),
+    ("business-startups", "Business & Startups"),
+    ("design", "Design"),
+    ("science", "Science"),
+    ("history", "History"),
+    ("finance", "Finance"),
+    ("culture", "Culture"),
+    ("politics", "Politics"),
+    ("health-fitness", "Health & Fitness"),
+    ("comedy", "Comedy"),
+    ("true-crime", "True Crime"),
+    ("sport", "Sport"),
+    ("personal-development", "Personal Development"),
+    ("food-cooking", "Food & Cooking"),
+    ("music", "Music"),
+    ("film-tv", "Film & TV"),
+    ("books-writing", "Books & Writing"),
+    ("philosophy", "Philosophy"),
+    ("climate-energy", "Climate & Energy"),
+    ("travel", "Travel"),
+)
+TOPIC_SLUGS = tuple(slug for slug, _ in TOPICS)
+TOPIC_LABELS = tuple(label for _, label in TOPICS)
+
 # --- Tuning -----------------------------------------------------------------
 
 RELEVANCE_BAR = 70  # the most important number here
-PICKS_PER_EMAIL = 2
-UNIVERSE_TARGET = 200
-# Three-interest onboarding profiles need 18 focused terms to leave 200 fresh
-# shows after staleness and usability filters. More interests naturally create
-# overlap, so dedupe and the fixed universe cap still bound the result.
+PICKS_PER_TOPIC = 10  # rows in daily_pick per topic per run
+MAX_PER_EMAIL = 10  # cap after merging a subscriber's topics
+
+# Caps a show across the whole email, at send time. CURATE_MAX_PER_SHOW below
+# only caps a show per topic list — without this second cap, a subscriber to
+# four topics could receive eight episodes from the same show.
+MAX_PER_SHOW_PER_EMAIL = 2
+
+# Caps a show per topic list, at curation time. Enforced in code, not the
+# tagging prompt — a prompt instruction is a request, a post-filter is a
+# guarantee.
+CURATE_MAX_PER_SHOW = 2
+
+# Staleness floor for late-tagged episodes: a long tagging backlog must not
+# surface three-week-old episodes as today's picks.
+CURATE_MAX_AGE_DAYS = 7
+
+# Live testing at v1's scale showed fewer terms could not leave 200 fresh
+# feeds for a three-interest profile after staleness and usability filters
+# (block-2-universe/README.md). Not re-verified at 20 topics / SHOW_TARGET
+# scale — Step 10 calls for re-measuring there.
 TERMS_PER_INTEREST = 18
+
+TAG_BATCH_SIZE = 20  # episodes per tagging call
+TAG_MAX_TOPICS = 3  # topics one episode may carry
+
+# Then abandon; without a cap, an episode whose description reliably produces
+# a generic why-line is retried on every run, forever, at cost, while looking
+# like a transient backlog rather than a permanent one.
+TAG_MAX_ATTEMPTS = 3
+
 MIN_DESC_CHARS = 100
 DESC_TRUNCATE = 400
 MAX_LOOKBACK_DAYS = 5
@@ -55,22 +112,27 @@ MIN_EPISODE_SEC = 180
 # handful, even for daily shows; this only bounds a pathological feed.
 EPISODES_PER_FEED = 25
 
-# Groq free-tier tokens-per-minute for GROQ_MODEL. This is the binding
-# constraint on the ranker. A full pool of candidates is ~25k tokens, so the
-# ranker cuts the pool down to what one call can hold. Check the real number
-# for your tier with `x-ratelimit-limit-tokens` on any response — raising it
-# widens the pool automatically, with no code change.
-GROQ_TPM = 8000
+# Groq free-tier tokens-per-minute for GROQ_MODEL. Paces tagging: a
+# TAG_BATCH_SIZE batch is ~4,400 tokens all-in, so this ceiling sets tagging
+# calls to roughly 2 a minute. Check the real number for your tier with
+# `x-ratelimit-limit-tokens` on any response — raising it speeds up a run,
+# with no code change.
+GROQ_TPM = 8_000
 
-# Upper bound on the ranking prompt. The real limit is usually GROQ_TPM minus
-# the reply; this only matters on a tier generous enough that context, not
-# rate, becomes the constraint.
-RANK_PROMPT_TOKENS = 20000
+# Groq free-tier tokens-per-day for GROQ_MODEL. This, not GROQ_TPM, is the
+# binding constraint on the whole product's reach — see ARCHITECTURE section
+# 9. It sets SHOW_TARGET below: after reserving headroom for retries and the
+# monthly seed, ~170,000 usable tokens/day at ~220 tokens/episode caps tagging
+# at ~770 episodes per run.
+GROQ_TPD = 200_000
 
-# Episodes from any one show the ranker may see. The pool is cut to fit the
-# budget, so letting a daily show spend ten slots costs nine other shows a
-# hearing.
-RANK_MAX_PER_SHOW = 2
+# DERIVED from GROQ_TPD, not chosen freely — see ARCHITECTURE section 9
+# before raising this. Shows publish roughly every 3 to 4 days, so a 2-day
+# run sees new episodes from about a third of the universe; ~770 taggable
+# episodes/run x 3 is ~2,300, hence 2,500 and not 5,000. Raising SHOW_TARGET
+# without raising the Groq tier silently truncates coverage, because episodes
+# still get fetched but never get tagged.
+SHOW_TARGET = 2_500
 
 # --- Paths ------------------------------------------------------------------
 
