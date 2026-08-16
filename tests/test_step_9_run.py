@@ -348,6 +348,7 @@ class RunTests(unittest.TestCase):
         )
         self.assertEqual(self.short_tag_options["episode_ids"], list(range(1, 11)))
         self.assertEqual(self.short_tag_options["limit"], 10)
+        self.assertEqual(self.short_tag_options["request_timeout_seconds"], 25)
         self.assertEqual(self.short_curate_options["episode_ids"], list(range(1, 11)))
         self.assertEqual(
             self.short_curate_options["topics"],

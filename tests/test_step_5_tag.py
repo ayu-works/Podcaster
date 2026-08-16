@@ -211,6 +211,39 @@ class TagTests(unittest.TestCase):
         self.run_tag(ObservingGroq([payload([valid_entry(1)])]))
         self.assertEqual(observed_attempts, [1])
 
+    def test_ten_episode_batch_uses_set_based_writes_and_reports_groq_request(self):
+        self.add_episodes(10)
+        client = FakeGroq(
+            [payload([valid_entry(index) for index in range(1, 11)])]
+        )
+        requests = []
+
+        class NoExecuteMany:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                if name == "executemany":
+                    raise AssertionError("tagging must not issue one remote write per row")
+                return getattr(self.connection, name)
+
+        with (
+            patch.object(tag, "log_call"),
+            patch.object(tag.time, "sleep"),
+            db.session(self.path) as conn,
+        ):
+            result = tag.tag_all(
+                NoExecuteMany(conn),
+                client=client,
+                episode_ids=list(range(1, 11)),
+                request_progress=lambda batch, attempt: requests.append(
+                    (batch, attempt)
+                ),
+            )
+
+        self.assertEqual(result.tagged, 10)
+        self.assertEqual(requests, [(1, 1)])
+
 
 if __name__ == "__main__":
     unittest.main()

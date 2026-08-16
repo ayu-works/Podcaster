@@ -205,6 +205,11 @@ def execute(
                     progress=lambda completed, total, current: print(
                         f"stage=tag progress {completed}/{total}", flush=True
                     ),
+                    request_progress=lambda batch, attempt: print(
+                        f"stage=tag groq-request batch={batch} attempt={attempt}",
+                        flush=True,
+                    ),
+                    request_timeout_seconds=config.SHORT_GROQ_TIMEOUT_SECONDS,
                 )
             tagged = tag.tag_all(conn, **tag_options)
             metrics.tagged = tagged.tagged

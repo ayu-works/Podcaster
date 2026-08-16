@@ -175,6 +175,7 @@ FETCH_BATCH_WORKERS = 3
 SHORT_DISCOVERY_FEED_TARGET = 30
 SHORT_EPISODE_LIMIT = 10
 SHORT_EMAIL_LIMIT = 2
+SHORT_GROQ_TIMEOUT_SECONDS = 25
 
 # --- Paths ------------------------------------------------------------------
 

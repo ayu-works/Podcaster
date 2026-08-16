@@ -223,13 +223,28 @@ def _record_attempt(
         ) + 1
     if dry_run:
         return
-    conn.executemany(
-        "UPDATE episode SET tag_attempts = tag_attempts + 1, tag_error = NULL WHERE id = ?",
-        [(row["id"],) for row in rows],
+    episode_ids = [row["id"] for row in rows]
+    placeholders = ",".join("?" for _ in episode_ids)
+    conn.execute(
+        "UPDATE episode SET tag_attempts = tag_attempts + 1, tag_error = NULL "
+        f"WHERE id IN ({placeholders})",
+        episode_ids,
     )
     # Never hold a remote transaction open while waiting for Groq. Besides
     # blocking concurrent writers, Turso can retire the idle HTTP stream.
     conn.commit()
+
+
+def _set_batch_error(conn, rows: list[sqlite3.Row], message: str) -> None:
+    """Set one shared error without one Turso request per episode."""
+    if not rows:
+        return
+    episode_ids = [row["id"] for row in rows]
+    placeholders = ",".join("?" for _ in episode_ids)
+    conn.execute(
+        f"UPDATE episode SET tag_error=? WHERE id IN ({placeholders})",
+        (message, *episode_ids),
+    )
 
 
 def _call(
@@ -242,6 +257,7 @@ def _call(
     state: CallState,
     dry_run: bool,
     budget: int,
+    request_progress=None,
 ) -> str:
     for retry in range(config.TAG_MAX_ATTEMPTS):
         if any(
@@ -257,6 +273,8 @@ def _call(
         _record_attempt(conn, rows, state, dry_run)
         try:
             state.last_call_at = time.monotonic()
+            if request_progress is not None:
+                request_progress(batch_id, retry + 1)
             response = client.chat.completions.create(
                 model=config.GROQ_MODEL,
                 messages=messages,
@@ -293,39 +311,65 @@ def _write_batch(
     result: TagResult,
     dry_run: bool,
 ) -> None:
+    valid: list[tuple[sqlite3.Row, ParsedTag]] = []
+    missing: list[sqlite3.Row] = []
+    generic: list[sqlite3.Row] = []
     for index, row in enumerate(rows, 1):
         tag = parsed.get(index)
         if tag is None:
             result.invalid += 1
-            if not dry_run:
-                conn.execute(
-                    "UPDATE episode SET tag_error = 'missing or invalid response entry' WHERE id = ?",
-                    (row["id"],),
-                )
+            missing.append(row)
             continue
         if looks_generic(tag.why, row["description"]):
             result.generic += 1
-            if not dry_run:
-                conn.execute(
-                    "UPDATE episode SET tag_error = 'generic or ungrounded why' WHERE id = ?",
-                    (row["id"],),
-                )
+            generic.append(row)
             continue
 
         result.tagged += 1
         result.rows.append((row["id"], tag.score, tag.topics, tag.why))
-        if dry_run:
-            continue
-        conn.execute(
-            "UPDATE episode SET score = ?, why = ?, tagged_at = datetime('now'), "
-            "tag_error = NULL WHERE id = ?",
-            (tag.score, tag.why, row["id"]),
-        )
-        conn.execute("DELETE FROM episode_topic WHERE episode_id = ?", (row["id"],))
-        conn.executemany(
-            "INSERT INTO episode_topic (episode_id, topic) VALUES (?, ?)",
-            [(row["id"], topic) for topic in tag.topics],
-        )
+        valid.append((row, tag))
+
+    if dry_run:
+        return
+    _set_batch_error(conn, missing, "missing or invalid response entry")
+    _set_batch_error(conn, generic, "generic or ungrounded why")
+    if not valid:
+        return
+
+    score_cases = " ".join("WHEN ? THEN ?" for _ in valid)
+    why_cases = " ".join("WHEN ? THEN ?" for _ in valid)
+    valid_ids = [row["id"] for row, _ in valid]
+    id_placeholders = ",".join("?" for _ in valid_ids)
+    parameters = [
+        value
+        for row, tag in valid
+        for value in (row["id"], tag.score)
+    ]
+    parameters.extend(
+        value
+        for row, tag in valid
+        for value in (row["id"], tag.why)
+    )
+    parameters.extend(valid_ids)
+    conn.execute(
+        "UPDATE episode SET "
+        f"score=CASE id {score_cases} END, "
+        f"why=CASE id {why_cases} END, "
+        "tagged_at=datetime('now'), tag_error=NULL "
+        f"WHERE id IN ({id_placeholders})",
+        parameters,
+    )
+    # Rows enter this function only while tagged_at is NULL, so they cannot
+    # already have model-derived topics. Insert all topics in one statement.
+    db.execute_values(
+        conn,
+        "INSERT INTO episode_topic (episode_id, topic) VALUES {values}",
+        [
+            (row["id"], topic)
+            for row, tag in valid
+            for topic in tag.topics
+        ],
+    )
 
 
 def tag_all(
@@ -336,6 +380,8 @@ def tag_all(
     daily_budget: int | None = None,
     episode_ids: list[int] | None = None,
     progress=None,
+    request_progress=None,
+    request_timeout_seconds: float | None = None,
 ) -> TagResult:
     if not config.GROQ_API_KEY and client is None:
         raise TagError("GROQ_API_KEY missing from .env; tagging cannot run")
@@ -344,7 +390,16 @@ def tag_all(
     if not rows:
         return result
 
-    groq = client or Groq(api_key=config.GROQ_API_KEY)
+    if request_timeout_seconds is not None and request_timeout_seconds <= 0:
+        raise ValueError("Groq request timeout must be positive")
+    groq = client or Groq(
+        api_key=config.GROQ_API_KEY,
+        **(
+            {"timeout": request_timeout_seconds, "max_retries": 0}
+            if request_timeout_seconds is not None
+            else {}
+        ),
+    )
     budget = config.GROQ_TPD if daily_budget is None else daily_budget
     state = CallState()
 
@@ -367,7 +422,7 @@ def tag_all(
             try:
                 raw = _call(
                     conn, batch, messages, prompt, start // config.TAG_BATCH_SIZE + 1,
-                    groq, state, dry_run, budget,
+                    groq, state, dry_run, budget, request_progress,
                 )
                 parsed, invalid = parse_tags(raw, len(batch))
                 result.invalid += invalid
@@ -375,10 +430,7 @@ def tag_all(
             except TagError as exc:
                 if not dry_run:
                     db.ensure_connection(conn)
-                    conn.executemany(
-                        "UPDATE episode SET tag_error = ? WHERE id = ?",
-                        [(str(exc), row["id"]) for row in batch],
-                    )
+                    _set_batch_error(conn, batch, str(exc))
                     conn.commit()
                 raise
             except BudgetExhausted:
@@ -400,17 +452,12 @@ def tag_all(
             if parse_error is not None:
                 result.parse_failed += len(batch)
             if not dry_run:
-                conn.executemany(
-                    "UPDATE episode SET tag_error = ? WHERE id = ?",
-                    [
-                        (
-                            f"unparseable response: {parse_error}"
-                            if parse_error is not None
-                            else "tag attempts exhausted",
-                            row["id"],
-                        )
-                        for row in batch
-                    ],
+                _set_batch_error(
+                    conn,
+                    batch,
+                    f"unparseable response: {parse_error}"
+                    if parse_error is not None
+                    else "tag attempts exhausted",
                 )
         else:
             _write_batch(conn, batch, parsed, result, dry_run)
@@ -422,7 +469,16 @@ def tag_all(
             break
 
     result.tokens_used = state.tokens_used
-    if not dry_run:
+    if not dry_run and episode_ids is not None:
+        tagged_ids = {row[0] for row in result.rows}
+        result.abandoned = sum(
+            row["id"] not in tagged_ids
+            and state.attempts.get(row["id"], row["tag_attempts"])
+            >= config.TAG_MAX_ATTEMPTS
+            for row in rows
+        )
+        result.untagged_left = result.selected - result.tagged - result.abandoned
+    elif not dry_run:
         result.untagged_left = conn.execute(
             "SELECT COUNT(*) FROM episode WHERE tagged_at IS NULL "
             "AND tag_attempts < ?",
