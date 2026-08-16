@@ -228,11 +228,21 @@ def deliver_subscriber(conn, subscriber, run_id: int, dry_run: bool = False) -> 
     )
 
 
-def deliver_all(conn, run_id: int, dry_run: bool = False) -> DeliveryResult:
-    subscribers = conn.execute(
+def deliver_all(
+    conn,
+    run_id: int,
+    dry_run: bool = False,
+    email: str | None = None,
+) -> DeliveryResult:
+    sql = (
         "SELECT id, email, unsub_token FROM subscriber "
-        "WHERE status='active' ORDER BY id"
-    ).fetchall()
+        "WHERE status='active'"
+    )
+    parameters = ()
+    if email:
+        sql += " AND email=?"
+        parameters = (email.strip().lower(),)
+    subscribers = conn.execute(sql + " ORDER BY id", parameters).fetchall()
     result = DeliveryResult()
     for subscriber in subscribers:
         # External send errors become a failed Delivery inside

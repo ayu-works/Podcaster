@@ -213,6 +213,22 @@ class EmailTests(unittest.TestCase):
         self.assertEqual(sent_count, 0)
         mocked_send.assert_not_called()
 
+    def test_targeted_delivery_never_sends_to_other_active_subscribers(self):
+        with db.session(self.path) as conn:
+            self.add_subscriber(conn, "target")
+            self.add_subscriber(conn, "other")
+            self.add_pick(conn, "targeted-pick")
+            with patch.object(email_out, "send", return_value="message-1") as send:
+                result = email_out.deliver_all(
+                    conn,
+                    self.run_id,
+                    email="  TARGET@example.com ",
+                )
+
+        self.assertEqual((result.sent, result.failed), (1, 0))
+        self.assertEqual(send.call_args.args[0], "target@example.com")
+        self.assertEqual(send.call_count, 1)
+
     def test_resend_headers(self):
         with patch.object(config, "RESEND_API_KEY", "valid-key"), patch.object(
             email_out.resend.Emails, "send", return_value={"id": "resend-1"}

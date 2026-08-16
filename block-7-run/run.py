@@ -85,6 +85,8 @@ def execute(
     dry_run: bool = False,
     skip_fetch: bool = False,
     skip_tag: bool = False,
+    tag_limit: int | None = None,
+    delivery_email: str | None = None,
 ) -> RunMetrics:
     """Execute one run with different failure rules for pipeline and delivery."""
     if os.getenv("GITHUB_ACTIONS") == "true" and not config.DATABASE_URL:
@@ -139,7 +141,7 @@ def execute(
         if skip_tag:
             metrics.untagged_left, metrics.tag_abandoned = _queue_counts(conn)
         else:
-            tagged = tag.tag_all(conn, dry_run=dry_run)
+            tagged = tag.tag_all(conn, limit=tag_limit, dry_run=dry_run)
             metrics.tagged = tagged.tagged
             metrics.untagged_left = tagged.untagged_left
             metrics.tag_abandoned = tagged.abandoned
@@ -154,10 +156,17 @@ def execute(
         conn.commit()
 
         stage = "send"
+        subscriber_sql = "SELECT COUNT(*) FROM subscriber WHERE status='active'"
+        subscriber_parameters = ()
+        if delivery_email:
+            subscriber_sql += " AND email=?"
+            subscriber_parameters = (delivery_email.strip().lower(),)
         metrics.subscribers = conn.execute(
-            "SELECT COUNT(*) FROM subscriber WHERE status='active'"
+            subscriber_sql, subscriber_parameters
         ).fetchone()[0]
-        delivered = email_out.deliver_all(conn, run_id, dry_run=dry_run)
+        delivered = email_out.deliver_all(
+            conn, run_id, dry_run=dry_run, email=delivery_email
+        )
         metrics.emails_sent = delivered.sent
         metrics.emails_failed = delivered.failed
         metrics.status = "partial" if delivered.failed else "ok"
@@ -200,7 +209,18 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-fetch", action="store_true")
     parser.add_argument("--skip-tag", action="store_true")
+    parser.add_argument(
+        "--tag-limit",
+        type=int,
+        help="tag at most this many newest queued episodes (manual smoke tests)",
+    )
+    parser.add_argument(
+        "--email",
+        help="deliver only to this active subscriber (manual test safety)",
+    )
     args = parser.parse_args()
+    if args.tag_limit is not None and args.tag_limit < 1:
+        parser.error("--tag-limit must be positive")
 
     db.init_db()
     with db.session() as conn:
@@ -209,6 +229,8 @@ def main() -> int:
             dry_run=args.dry_run,
             skip_fetch=args.skip_fetch,
             skip_tag=args.skip_tag,
+            tag_limit=args.tag_limit,
+            delivery_email=args.email,
         )
     print(json.dumps(asdict(metrics), sort_keys=True))
     return 1 if metrics.status in ("failed", "partial") else 0

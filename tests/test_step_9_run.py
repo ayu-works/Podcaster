@@ -27,6 +27,8 @@ class RunTests(unittest.TestCase):
         db.init_db(self.path)
         self.log_patch = patch.object(config, "RUN_LOG_PATH", self.log_path)
         self.log_patch.start()
+        self.tag_limits = []
+        self.delivery_emails = []
 
     def tearDown(self):
         self.log_patch.stop()
@@ -58,16 +60,18 @@ class RunTests(unittest.TestCase):
         def fetch_fake(target, run_id):
             return self.fetch_stage(events, target, run_id)
 
-        def tag_fake(target, dry_run=False):
+        def tag_fake(target, limit=None, dry_run=False):
             events.append("tag")
+            self.tag_limits.append(limit)
             return self.tag_result()
 
         def curate_fake(target, run_id, previous_cutoff=None):
             events.append("curate")
             return SimpleNamespace(counts_by_topic={"technology-ai": 2, "travel": 0})
 
-        def send_fake(target, run_id, dry_run=False):
+        def send_fake(target, run_id, dry_run=False, email=None):
             events.append("send")
+            self.delivery_emails.append(email)
             return delivery
 
         return (
@@ -86,10 +90,16 @@ class RunTests(unittest.TestCase):
             )
             fetch_patch, tag_patch, curate_patch, send_patch = self.patches(conn, events)
             with fetch_patch, tag_patch, curate_patch, send_patch:
-                metrics = pipeline.execute(conn)
+                metrics = pipeline.execute(
+                    conn,
+                    tag_limit=100,
+                    delivery_email="active@example.com",
+                )
             row = conn.execute("SELECT * FROM run WHERE id=?", (metrics.run_id,)).fetchone()
 
         self.assertEqual(events, ["fetch", "tag", "curate", "send"])
+        self.assertEqual(self.tag_limits, [100])
+        self.assertEqual(self.delivery_emails, ["active@example.com"])
         self.assertEqual(metrics.status, "ok")
         self.assertEqual((metrics.score_p50, metrics.score_p90), (70, 90))
         self.assertEqual((row["status"], row["fetched"], row["tagged"]), ("ok", 747, 3))
@@ -186,6 +196,16 @@ class RunTests(unittest.TestCase):
         entrypoint = (ROOT / "index.py").read_text(encoding="utf-8")
         self.assertIn("from app import app", entrypoint)
         self.assertFalse((ROOT / "vercel.json").exists())
+
+    def test_manual_workflow_defaults_safe_and_supports_tag_limit(self):
+        workflow = (ROOT / ".github/workflows/run.yml").read_text(encoding="utf-8")
+        self.assertIn("tag_limit:", workflow)
+        self.assertIn("recipient:", workflow)
+        self.assertIn("args+=(--tag-limit", workflow)
+        self.assertIn("args+=(--email", workflow)
+        self.assertIn('description: "Preview without sending or persisting tags"', workflow)
+        dry_run_section = workflow.split("dry_run:", 1)[1].split("tag_limit:", 1)[0]
+        self.assertIn("default: true", dry_run_section)
 
 
 if __name__ == "__main__":
