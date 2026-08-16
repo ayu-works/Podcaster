@@ -155,6 +155,14 @@ FROM_EMAIL = os.getenv("FROM_EMAIL", "onboarding@resend.dev")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
+# --- Database (Turso / libSQL, ARCHITECTURE section 7) ----------------------
+
+# Remote (libsql:// or https://) once a Turso database exists; empty for now,
+# which makes db.connect() fall back to a local SQLite file at DB_PATH. A
+# file:... URL points at a throwaway file instead, for tests (S2-01c).
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_TOKEN = os.getenv("DATABASE_TOKEN", "")
+
 # Which secrets each block needs before it can run. Keeps the check honest
 # about what is actually blocking, rather than demanding everything up front.
 KEYS_BY_BLOCK = {

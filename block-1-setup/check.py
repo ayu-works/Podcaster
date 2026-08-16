@@ -1,4 +1,4 @@
-"""Block 1 check: deps import, env is loaded, and the six tables exist."""
+"""Block 1 check: deps import, env is loaded, and the nine tables exist."""
 
 import importlib.util
 import sys
@@ -7,6 +7,11 @@ import config
 import db
 
 DEPS = ("httpx", "feedparser", "groq", "jinja2", "resend", "flask", "dotenv")
+# libsql is deliberately NOT in DEPS: it's only required on the remote branch
+# of db.connect(), and there are no Turso credentials yet, so this machine
+# runs the local SQLite fallback. Requiring it here would fail every local
+# check for a package nothing local-only needs. db.connect() itself is what
+# reports libsql problems -- loudly, at connect time -- once it's needed.
 
 
 def main() -> int:
@@ -26,7 +31,11 @@ def main() -> int:
         print(f"FAIL  tables missing: {', '.join(missing_tables)}")
         ok = False
     else:
-        print(f"ok    {len(db.TABLES)} tables in {config.DB_PATH.name}: {', '.join(found)}")
+        # Never config.DB_PATH.name unconditionally: DATABASE_URL can point
+        # init_db() at Turso or a throwaway local file, and naming the wrong
+        # target is worse than naming none. Never print DATABASE_TOKEN.
+        target = config.DATABASE_URL or config.DB_PATH.name
+        print(f"ok    {len(db.TABLES)} tables in {target}: {', '.join(found)}")
 
     # Not fatal for Block 1 — nothing calls out yet — but each block is blocked
     # until its own keys are filled in.

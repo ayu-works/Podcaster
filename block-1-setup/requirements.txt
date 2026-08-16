@@ -5,3 +5,4 @@ jinja2
 resend
 flask
 python-dotenv
+libsql
