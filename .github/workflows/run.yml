@@ -1,27 +1,23 @@
-name: digest
+name: main digest
 
 on:
   schedule:
     - cron: "30 1 * * 0,1,3,5" # 07:00 IST, Sun/Mon/Wed/Fri
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "Preview without sending or persisting tags"
-        type: boolean
-        default: true
-      tag_limit:
-        description: "Newest episodes to tag (0 = full production queue)"
-        type: number
-        default: 0
       recipient:
-        description: "Optional exact active subscriber for a manual test"
+        description: "Optional exact active subscriber; blank sends to all"
         type: string
         default: ""
+
+concurrency:
+  group: podcaster-pipeline
+  cancel-in-progress: false
 
 jobs:
   digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,31 +25,63 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r block-1-setup/requirements.txt
-      - name: Run digest
+
+      - name: Check database
+        run: timeout --signal=TERM --kill-after=5s 30s python block-7-run/staged.py check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
+
+      - name: Start run
+        id: start
+        run: timeout --signal=TERM --kill-after=5s 30s python block-7-run/staged.py start --github-output "$GITHUB_OUTPUT"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
+
+      - name: Fetch 240 dynamically discovered feeds
+        run: timeout --signal=TERM --kill-after=5s 180s python block-7-run/staged.py fetch --run-id "${{ steps.start.outputs.run_id }}"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
+          PODCASTINDEX_KEY: ${{ secrets.PODCASTINDEX_KEY }}
+          PODCASTINDEX_SECRET: ${{ secrets.PODCASTINDEX_SECRET }}
+
+      - name: Tag at most 100 episodes
+        run: timeout --signal=TERM --kill-after=5s 240s python block-7-run/staged.py tag --run-id "${{ steps.start.outputs.run_id }}" --limit 100
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
+      - name: Curate shared topic lists
+        run: timeout --signal=TERM --kill-after=5s 60s python block-7-run/staged.py curate --run-id "${{ steps.start.outputs.run_id }}"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
+
+      - name: Send subscriber digests
         run: |
-          args=()
-          if [[ "$INPUT_DRY_RUN" == "true" ]]; then
-            args+=(--dry-run)
-          fi
-          if [[ "$INPUT_TAG_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
-            args+=(--tag-limit "$INPUT_TAG_LIMIT")
-          fi
+          args=(python block-7-run/staged.py send --run-id "${{ steps.start.outputs.run_id }}")
           if [[ -n "$INPUT_RECIPIENT" ]]; then
             args+=(--email "$INPUT_RECIPIENT")
           fi
-          python block-7-run/run.py "${args[@]}"
+          timeout --signal=TERM --kill-after=5s 60s "${args[@]}"
         env:
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
-          INPUT_TAG_LIMIT: ${{ inputs.tag_limit }}
           INPUT_RECIPIENT: ${{ inputs.recipient }}
-          PODCASTINDEX_KEY: ${{ secrets.PODCASTINDEX_KEY }}
-          PODCASTINDEX_SECRET: ${{ secrets.PODCASTINDEX_SECRET }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           FROM_EMAIL: ${{ vars.FROM_EMAIL }}
           PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
+
+      - name: Mark interrupted run failed
+        if: ${{ failure() && steps.start.outputs.run_id != '' }}
+        run: timeout --signal=TERM --kill-after=5s 30s python block-7-run/staged.py fail --run-id "${{ steps.start.outputs.run_id }}"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
+
       - if: always()
         uses: actions/upload-artifact@v4
         with:

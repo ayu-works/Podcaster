@@ -170,6 +170,12 @@ EPISODE_FEED_BATCH_SIZE = 200
 EPISODE_BATCH_MAX_RESULTS = 1_000
 FETCH_BATCH_WORKERS = 3
 
+# Real end-to-end smoke run: one small fetch and one model call, with a hard
+# two-minute GitHub Actions timeout. It uses the target subscriber's topics.
+SHORT_DISCOVERY_FEED_TARGET = 30
+SHORT_EPISODE_LIMIT = 10
+SHORT_EMAIL_LIMIT = 2
+
 # --- Paths ------------------------------------------------------------------
 
 DB_PATH = PROJECT_ROOT / "podcaster.db"

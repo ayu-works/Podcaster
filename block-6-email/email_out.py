@@ -74,7 +74,12 @@ def _pretty_date(value: str | None) -> str:
         return value[:10]
 
 
-def load_picks(conn, subscriber_id: int, run_id: int) -> list[dict]:
+def load_picks(
+    conn,
+    subscriber_id: int,
+    run_id: int,
+    max_picks: int | None = None,
+) -> list[dict]:
     """Merge subscribed topics, dedupe, and enforce whole-email caps."""
     rows = conn.execute(
         """
@@ -91,6 +96,9 @@ def load_picks(conn, subscriber_id: int, run_id: int) -> list[dict]:
         (run_id, subscriber_id),
     ).fetchall()
 
+    pick_limit = config.MAX_PER_EMAIL if max_picks is None else max_picks
+    if pick_limit < 1:
+        raise ValueError("max_picks must be positive")
     selected: list[dict] = []
     seen_episodes: set[int] = set()
     show_counts: Counter = Counter()
@@ -102,7 +110,7 @@ def load_picks(conn, subscriber_id: int, run_id: int) -> list[dict]:
         seen_episodes.add(row["id"])
         show_counts[row["feed_id"]] += 1
         selected.append(dict(row))
-        if len(selected) == config.MAX_PER_EMAIL:
+        if len(selected) == pick_limit:
             break
     return selected
 
@@ -195,8 +203,22 @@ def _mark(conn, subscriber_id: int, episode_ids: list[int], status: str, error: 
     conn.commit()
 
 
-def deliver_subscriber(conn, subscriber, run_id: int, dry_run: bool = False) -> Delivery:
-    picks = load_picks(conn, subscriber["id"], run_id)
+def deliver_subscriber(
+    conn,
+    subscriber,
+    run_id: int,
+    dry_run: bool = False,
+    max_picks: int | None = None,
+    min_picks: int | None = None,
+) -> Delivery:
+    picks = load_picks(conn, subscriber["id"], run_id, max_picks=max_picks)
+    if min_picks is not None and len(picks) < min_picks:
+        return Delivery(
+            subscriber["id"],
+            subscriber["email"],
+            "skipped",
+            error=f"requires {min_picks} picks but found {len(picks)}",
+        )
     if not picks:
         return Delivery(subscriber["id"], subscriber["email"], "skipped")
 
@@ -238,6 +260,8 @@ def deliver_all(
     run_id: int,
     dry_run: bool = False,
     email: str | None = None,
+    max_picks: int | None = None,
+    min_picks: int | None = None,
 ) -> DeliveryResult:
     sql = (
         "SELECT id, email, unsub_token FROM subscriber "
@@ -255,7 +279,14 @@ def deliver_all(
         # recipient-specific render or database problem from later recipients.
         try:
             db.ensure_connection(conn)
-            delivery = deliver_subscriber(conn, subscriber, run_id, dry_run=dry_run)
+            delivery = deliver_subscriber(
+                conn,
+                subscriber,
+                run_id,
+                dry_run=dry_run,
+                max_picks=max_picks,
+                min_picks=min_picks,
+            )
         except Exception as exc:  # noqa: BLE001 -- isolation is the contract
             try:
                 conn.rollback()

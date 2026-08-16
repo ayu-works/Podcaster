@@ -42,6 +42,9 @@ Run tests from the repository root:
 
 Run the full pipeline from `block-7-run/` with `../.venv/bin/python run.py`.
 Use `--dry-run`, `--skip-fetch`, and `--skip-tag` for controlled iteration.
+Use `--short-digest --email <active-subscriber>` only for the bounded real
+smoke path (30 feeds, 10 episodes, at most two emailed picks). GitHub's main
+workflow uses `staged.py` so Fetch, Tag, Curate, and Send have separate limits.
 
 ## Conventions and invariants
 

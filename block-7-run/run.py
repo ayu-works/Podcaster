@@ -79,6 +79,19 @@ def _queue_counts(conn) -> tuple[int, int]:
     return untagged, abandoned
 
 
+def _subscriber_topics(conn, email: str) -> tuple[str, ...]:
+    rows = conn.execute(
+        "SELECT sub.topic FROM subscriber s "
+        "JOIN subscription sub ON sub.subscriber_id=s.id "
+        "WHERE s.status='active' AND s.email=? ORDER BY sub.topic",
+        (email.strip().lower(),),
+    ).fetchall()
+    topics = tuple(row[0] for row in rows)
+    if not topics:
+        raise RuntimeError("short digest requires an active subscriber with topics")
+    return topics
+
+
 def _safe_rollback(conn) -> None:
     """Best-effort cleanup that must not replace the pipeline exception."""
     try:
@@ -95,12 +108,22 @@ def execute(
     skip_tag: bool = False,
     tag_limit: int | None = None,
     delivery_email: str | None = None,
+    short_digest: bool = False,
 ) -> RunMetrics:
     """Execute one run with different failure rules for pipeline and delivery."""
     if os.getenv("GITHUB_ACTIONS") == "true" and not config.DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL is required in GitHub Actions; local SQLite is ephemeral"
         )
+    if short_digest and (skip_fetch or skip_tag or dry_run or not delivery_email):
+        raise ValueError(
+            "short digest requires a real fetch, tagging, and targeted delivery"
+        )
+
+    short_topics: tuple[str, ...] | None = None
+    short_episode_ids: list[int] | None = None
+    if short_digest:
+        short_topics = _subscriber_topics(conn, delivery_email)
 
     if skip_fetch:
         existing = _latest_fetched_run(conn)
@@ -128,6 +151,7 @@ def execute(
     )
     stage = "fetch"
     try:
+        print(f"stage={stage} start", flush=True)
         if skip_fetch:
             row = conn.execute(
                 "SELECT fetch_cutoff_at, fetched FROM run WHERE id=?", (run_id,)
@@ -138,9 +162,23 @@ def execute(
                 "SELECT COUNT(*) FROM show WHERE status='active'"
             ).fetchone()[0]
         else:
-            fetched = fetch.fetch_all(conn, run_id=run_id)
+            fetch_options = {"run_id": run_id}
+            if short_digest:
+                fetch_options.update(
+                    since=fetch.since_timestamp(None),
+                    discovery_topics=short_topics,
+                    discovery_target=config.SHORT_DISCOVERY_FEED_TARGET,
+                    candidate_limit=config.SHORT_EPISODE_LIMIT,
+                )
+            fetched = fetch.fetch_all(conn, **fetch_options)
             metrics.shows = fetched.shows
             metrics.fetched = fetched.after_filter
+            if short_digest:
+                short_episode_ids = [row["id"] for row in fetched.candidates]
+                if not short_episode_ids:
+                    raise RuntimeError(
+                        "short digest found no new or untagged episodes to test"
+                    )
             metrics.fetch_cutoff_at = conn.execute(
                 "SELECT fetch_cutoff_at FROM run WHERE id=?", (run_id,)
             ).fetchone()[0]
@@ -149,12 +187,26 @@ def execute(
         # slower Groq stage so concurrent writers are not blocked and Turso
         # does not have to retain a transaction stream during model calls.
         conn.commit()
+        print(
+            f"stage=fetch done shows={metrics.shows} episodes={metrics.fetched}",
+            flush=True,
+        )
 
         stage = "tag"
+        print(f"stage={stage} start", flush=True)
         if skip_tag:
             metrics.untagged_left, metrics.tag_abandoned = _queue_counts(conn)
         else:
-            tagged = tag.tag_all(conn, limit=tag_limit, dry_run=dry_run)
+            tag_options = {"limit": tag_limit, "dry_run": dry_run}
+            if short_digest:
+                tag_options.update(
+                    limit=config.SHORT_EPISODE_LIMIT,
+                    episode_ids=short_episode_ids,
+                    progress=lambda completed, total, current: print(
+                        f"stage=tag progress {completed}/{total}", flush=True
+                    ),
+                )
+            tagged = tag.tag_all(conn, **tag_options)
             metrics.tagged = tagged.tagged
             metrics.untagged_left = tagged.untagged_left
             metrics.tag_abandoned = tagged.abandoned
@@ -162,13 +214,26 @@ def execute(
             scores = [row[1] for row in tagged.rows]
             metrics.score_p50 = _percentile(scores, 0.50)
             metrics.score_p90 = _percentile(scores, 0.90)
+        print(f"stage=tag done tagged={metrics.tagged}", flush=True)
 
         stage = "curate"
-        curated = curate.curate(conn, run_id, previous_cutoff=previous_cutoff)
+        print(f"stage={stage} start", flush=True)
+        curate_options = {"previous_cutoff": previous_cutoff}
+        if short_digest:
+            curate_options.update(
+                eligible_episode_ids=short_episode_ids,
+                min_score=0,
+            )
+        curated = curate.curate(conn, run_id, **curate_options)
         metrics.picks_by_topic = curated.counts_by_topic
         conn.commit()
+        print(
+            f"stage=curate done picks={sum(curated.counts_by_topic.values())}",
+            flush=True,
+        )
 
         stage = "send"
+        print(f"stage={stage} start", flush=True)
         subscriber_sql = "SELECT COUNT(*) FROM subscriber WHERE status='active'"
         subscriber_parameters = ()
         if delivery_email:
@@ -177,12 +242,20 @@ def execute(
         metrics.subscribers = conn.execute(
             subscriber_sql, subscriber_parameters
         ).fetchone()[0]
-        delivered = email_out.deliver_all(
-            conn, run_id, dry_run=dry_run, email=delivery_email
-        )
+        delivery_options = {"dry_run": dry_run, "email": delivery_email}
+        if short_digest:
+            delivery_options["max_picks"] = config.SHORT_EMAIL_LIMIT
+            delivery_options["min_picks"] = config.SHORT_EMAIL_LIMIT
+        delivered = email_out.deliver_all(conn, run_id, **delivery_options)
         metrics.emails_sent = delivered.sent
         metrics.emails_failed = delivered.failed
         metrics.status = "partial" if delivered.failed else "ok"
+        if short_digest and metrics.emails_sent != 1:
+            raise RuntimeError(
+                "short digest did not send exactly one email; no qualifying picks "
+                "or delivery failed"
+            )
+        print(f"stage=send done emails={metrics.emails_sent}", flush=True)
 
         if mutable_status:
             conn.execute(
@@ -238,6 +311,11 @@ def main() -> int:
         help="tag at most this many newest queued episodes (manual smoke tests)",
     )
     parser.add_argument(
+        "--short-digest",
+        action="store_true",
+        help="real bounded smoke: 30 feeds, 10 episodes, at most 2 emailed picks",
+    )
+    parser.add_argument(
         "--email",
         help="deliver only to this active subscriber (manual test safety)",
     )
@@ -245,7 +323,8 @@ def main() -> int:
     if args.tag_limit is not None and args.tag_limit < 1:
         parser.error("--tag-limit must be positive")
 
-    db.init_db()
+    if not args.short_digest:
+        db.init_db()
     with db.session() as conn:
         metrics = execute(
             conn,
@@ -254,6 +333,7 @@ def main() -> int:
             skip_tag=args.skip_tag,
             tag_limit=args.tag_limit,
             delivery_email=args.email,
+            short_digest=args.short_digest,
         )
     print(json.dumps(asdict(metrics), sort_keys=True))
     return 1 if metrics.status in ("failed", "partial") else 0

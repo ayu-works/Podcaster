@@ -92,14 +92,18 @@ idempotent. Honeypot and per-IP throttling are present. The repository-root
 ## Step 9 — orchestration and scheduling
 
 Completed locally. `block-7-run/run.py` executes discover/fetch -> tag ->
-curate -> send, records the required metrics, and supports `--dry-run`,
-`--skip-fetch`, and `--skip-tag`. Pipeline failures are `failed`; isolated
-delivery failures are `partial`.
+curate -> send and also provides a bounded real `--short-digest` smoke path:
+30 subscriber-topic feeds, at most 10 stored/tagged episodes, and at most two
+emailed picks. Pipeline failures are `failed`; isolated delivery failures are
+`partial`.
 
-`.github/workflows/run.yml` schedules 07:00 IST on Sun/Mon/Wed/Fri, supports a
-manual trigger, requires remote database state in Actions, and uploads logs on
-every outcome. There is intentionally no monthly seed workflow: dynamic
-category discovery refreshes every scheduled run.
+`.github/workflows/run.yml` schedules 07:00 IST on Sun/Mon/Wed/Fri and runs
+separate Check, Start, Fetch, Tag, Curate, and Send commands against one run ID.
+Fetch has a three-minute process timeout, Tag is capped at 100 episodes and four
+minutes, the job is capped at ten minutes, and interrupted rows are marked
+failed. `.github/workflows/short-digest.yml` is capped at two minutes. There is
+intentionally no monthly seed workflow: dynamic category discovery refreshes
+every scheduled run.
 
 Hosted gate still pending: trigger `workflow_dispatch` with the laptop off and
 confirm a real second-address delivery after Step 0's external setup.

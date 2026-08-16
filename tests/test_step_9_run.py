@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "block-1-setup"))
 import config  # noqa: E402
 import db  # noqa: E402
 import run as pipeline  # noqa: E402
+import staged  # noqa: E402
 
 
 class RunTests(unittest.TestCase):
@@ -256,26 +257,152 @@ class RunTests(unittest.TestCase):
         self.assertIn("from app import app", entrypoint)
         self.assertFalse((ROOT / "vercel.json").exists())
 
-    def test_manual_workflow_defaults_safe_and_supports_tag_limit(self):
+    def test_main_workflow_is_staged_and_bounded(self):
         workflow = (ROOT / ".github/workflows/run.yml").read_text(encoding="utf-8")
-        self.assertIn("tag_limit:", workflow)
-        self.assertIn("recipient:", workflow)
-        self.assertIn("args+=(--tag-limit", workflow)
-        self.assertIn("args+=(--email", workflow)
-        self.assertIn('description: "Preview without sending or persisting tags"', workflow)
-        dry_run_section = workflow.split("dry_run:", 1)[1].split("tag_limit:", 1)[0]
-        self.assertIn("default: true", dry_run_section)
+        self.assertIn("name: main digest", workflow)
+        for stage in (
+            "Start run",
+            "Fetch 240 dynamically discovered feeds",
+            "Tag at most 100 episodes",
+            "Curate shared topic lists",
+            "Send subscriber digests",
+            "Mark interrupted run failed",
+        ):
+            self.assertIn(stage, workflow)
+        self.assertIn("timeout-minutes: 10", workflow)
+        self.assertIn("--kill-after=5s 180s", workflow)
+        self.assertIn("--kill-after=5s 240s", workflow)
+        self.assertNotIn("python block-7-run/run.py", workflow)
 
-    def test_short_digest_skips_fetch_and_cannot_send(self):
+    def test_short_digest_is_bounded_real_delivery_with_hard_timeout(self):
         workflow = (ROOT / ".github/workflows/short-digest.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn("name: short digest", workflow)
-        self.assertIn("--skip-fetch", workflow)
-        self.assertIn("--tag-limit 20", workflow)
-        self.assertIn("--dry-run", workflow)
-        self.assertNotIn("PODCASTINDEX_KEY", workflow)
+        self.assertIn("--short-digest", workflow)
+        self.assertIn("--email ayushmayank77@gmail.com", workflow)
+        self.assertIn("timeout-minutes: 2", workflow)
+        self.assertNotIn("--dry-run", workflow)
+        self.assertIn("PODCASTINDEX_KEY", workflow)
+        self.assertIn("RESEND_API_KEY", workflow)
         self.assertIn('paths:\n      - ".github/workflows/short-digest.yml"', workflow)
+
+    def test_short_digest_passes_exact_bounds_through_every_stage(self):
+        with db.session(self.path) as conn:
+            subscriber_id = conn.execute(
+                "INSERT INTO subscriber "
+                "(email, unsub_token, confirm_token, status, confirmed_at) "
+                "VALUES ('target@example.com', 'u', 'c', 'active', datetime('now'))"
+            ).lastrowid
+            conn.executemany(
+                "INSERT INTO subscription (subscriber_id, topic) VALUES (?, ?)",
+                [(subscriber_id, topic) for topic in ("design", "science", "history")],
+            )
+
+            def fetch_short(target, run_id, **kwargs):
+                target.execute(
+                    "UPDATE run SET fetch_cutoff_at=datetime('now') WHERE id=?",
+                    (run_id,),
+                )
+                target.commit()
+                self.short_fetch_options = kwargs
+                return SimpleNamespace(
+                    shows=30,
+                    after_filter=10,
+                    candidates=[{"id": index} for index in range(1, 11)],
+                )
+
+            def tag_short(target, **kwargs):
+                self.short_tag_options = kwargs
+                return self.tag_result()
+
+            def curate_short(target, run_id, **kwargs):
+                self.short_curate_options = kwargs
+                return SimpleNamespace(counts_by_topic={"science": 2})
+
+            def send_short(target, run_id, **kwargs):
+                self.short_send_options = kwargs
+                return SimpleNamespace(sent=1, failed=0)
+
+            with patch.object(pipeline.fetch, "fetch_all", side_effect=fetch_short), patch.object(
+                pipeline.tag, "tag_all", side_effect=tag_short
+            ), patch.object(pipeline.curate, "curate", side_effect=curate_short), patch.object(
+                pipeline.email_out, "deliver_all", side_effect=send_short
+            ):
+                metrics = pipeline.execute(
+                    conn,
+                    delivery_email="target@example.com",
+                    short_digest=True,
+                )
+
+        self.assertEqual(metrics.emails_sent, 1)
+        self.assertEqual(self.short_fetch_options["discovery_target"], 30)
+        self.assertEqual(self.short_fetch_options["candidate_limit"], 10)
+        self.assertEqual(
+            self.short_fetch_options["discovery_topics"],
+            ("design", "history", "science"),
+        )
+        self.assertEqual(self.short_tag_options["episode_ids"], list(range(1, 11)))
+        self.assertEqual(self.short_tag_options["limit"], 10)
+        self.assertEqual(self.short_curate_options["eligible_episode_ids"], list(range(1, 11)))
+        self.assertEqual(self.short_curate_options["min_score"], 0)
+        self.assertEqual(self.short_send_options["max_picks"], 2)
+        self.assertEqual(self.short_send_options["min_picks"], 2)
+
+    def test_staged_main_persists_one_run_across_bounded_steps(self):
+        events = []
+        with db.session(self.path) as conn:
+            self.assertEqual(staged.check_stage(conn)["database"], "ok")
+            run_id = staged.start_stage(conn)["run_id"]
+
+            def fetch_fake(target, run_id, **kwargs):
+                events.append("fetch")
+                target.execute(
+                    "UPDATE run SET fetch_cutoff_at='2026-08-16 10:00:00' WHERE id=?",
+                    (run_id,),
+                )
+                target.commit()
+                return SimpleNamespace(shows=240, after_filter=50)
+
+            tag_result = SimpleNamespace(
+                selected=100,
+                tagged=80,
+                tokens_used=1000,
+                untagged_left=20,
+            )
+            with patch.object(staged.fetch, "fetch_all", side_effect=fetch_fake), patch.object(
+                staged.tag, "tag_all", return_value=tag_result
+            ) as tag_call, patch.object(
+                staged.curate,
+                "curate",
+                return_value=SimpleNamespace(total=12),
+            ), patch.object(
+                staged.email_out,
+                "deliver_all",
+                return_value=SimpleNamespace(sent=1, failed=0, skipped=0),
+            ):
+                staged.fetch_stage(conn, run_id)
+                staged.tag_stage(conn, run_id, limit=100)
+                staged.curate_stage(conn, run_id)
+                result = staged.send_stage(conn, run_id, email="target@example.com")
+
+            row = conn.execute("SELECT * FROM run WHERE id=?", (run_id,)).fetchone()
+
+        self.assertEqual(events, ["fetch"])
+        self.assertEqual(tag_call.call_args.kwargs["limit"], 100)
+        self.assertEqual((row["fetched"], row["tagged"], row["status"]), (50, 80, "ok"))
+        self.assertEqual(result["sent"], 1)
+
+    def test_staged_main_rejects_unbounded_tagging(self):
+        with db.session(self.path) as conn:
+            run_id = staged.start_stage(conn)["run_id"]
+            conn.execute(
+                "UPDATE run SET fetch_cutoff_at=datetime('now') WHERE id=?",
+                (run_id,),
+            )
+            conn.commit()
+            with self.assertRaisesRegex(ValueError, "between 1 and 100"):
+                staged.tag_stage(conn, run_id, limit=101)
 
 
 if __name__ == "__main__":

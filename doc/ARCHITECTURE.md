@@ -218,3 +218,10 @@ Sun/Mon/Wed/Fri. There is no monthly seed workflow because discovery refreshes
 from recent category feeds every run. GitHub may delay cron jobs; the cutoff
 window makes that safe. A completely absent job remains the most silent failure
 and must be detected by a run-log gap.
+
+The hosted workflow exposes database check, run creation, fetch, tag, curate,
+and send as separate timed steps. They share a persisted run ID, never an
+in-memory runner state. Fetch is killed after three minutes; tagging processes
+at most 100 episodes and is killed after four minutes; the whole job is killed
+after ten. A separate two-minute real smoke workflow discovers only the target
+subscriber's topics, stores/tags at most ten episodes, and emails at most two.

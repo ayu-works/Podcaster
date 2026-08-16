@@ -11,8 +11,11 @@ on:
 
 jobs:
   short-digest:
+    concurrency:
+      group: podcaster-pipeline
+      cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,10 +23,16 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r block-1-setup/requirements.txt
-      - name: Preview a short digest
-        run: python block-7-run/run.py --skip-fetch --tag-limit 20 --dry-run
+      - name: Send a short digest
+        run: >-
+          timeout --signal=TERM --kill-after=5s 90s
+          python block-7-run/run.py --short-digest
+          --email ayushmayank77@gmail.com
         env:
+          PODCASTINDEX_KEY: ${{ secrets.PODCASTINDEX_KEY }}
+          PODCASTINDEX_SECRET: ${{ secrets.PODCASTINDEX_SECRET }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
           FROM_EMAIL: ${{ vars.FROM_EMAIL }}

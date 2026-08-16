@@ -100,6 +100,10 @@ episode is genuinely worth playing.
   percentile, pick, subscriber, and delivery signals.
 - Workflow cron is `30 1 * * 0,1,3,5`, manual dispatch exists, credentials come
   from secrets/variables, and logs upload with `if: always()`.
+- Main workflow stages are visible separately; Fetch is limited to 180 seconds,
+  Tag to 100 episodes/240 seconds, and the whole job to ten minutes. The real
+  short digest is limited to 30 feeds, 10 taggable episodes, two emailed picks,
+  and 120 seconds including setup.
 - There is no monthly static seed: every run refreshes recent category feeds.
 
 ## External acceptance gates

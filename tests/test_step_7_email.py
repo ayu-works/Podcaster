@@ -234,6 +234,34 @@ class EmailTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[0], "target@example.com")
         self.assertEqual(send.call_count, 1)
 
+    def test_short_delivery_caps_merged_email_at_two_picks(self):
+        with db.session(self.path) as conn:
+            subscriber_id = self.add_subscriber(conn, "short")
+            for index in range(5):
+                self.add_pick(conn, f"short-{index}", rank=index + 1)
+            picks = email_out.load_picks(
+                conn,
+                subscriber_id,
+                self.run_id,
+                max_picks=2,
+            )
+        self.assertEqual(len(picks), 2)
+
+    def test_short_delivery_sends_nothing_until_two_unique_picks_exist(self):
+        with db.session(self.path) as conn:
+            self.add_subscriber(conn, "not-enough")
+            self.add_pick(conn, "only-one")
+            with patch.object(email_out, "send") as send:
+                result = email_out.deliver_all(
+                    conn,
+                    self.run_id,
+                    email="not-enough@example.com",
+                    max_picks=2,
+                    min_picks=2,
+                )
+        self.assertEqual((result.sent, result.skipped), (0, 1))
+        send.assert_not_called()
+
     def test_resend_headers(self):
         with patch.object(config, "RESEND_API_KEY", "valid-key"), patch.object(
             email_out.resend.Emails, "send", return_value={"id": "resend-1"}

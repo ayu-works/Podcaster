@@ -136,6 +136,47 @@ class FetchTests(unittest.TestCase):
                     )
             self.assertEqual(result.stored, 1)
 
+    def test_short_fetch_persists_at_most_ten_filtered_episodes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.make_db(temp_dir)
+            episodes = [episode(f"bounded-{index}") for index in range(25)]
+            with patch.object(fetch, "fetch_feeds", return_value=(episodes, 25, 0)):
+                with db.session(path) as conn:
+                    run_id = conn.execute("INSERT INTO run DEFAULT VALUES").lastrowid
+                    result = fetch.fetch_all(
+                        conn,
+                        since=0,
+                        run_id=run_id,
+                        refresh_discovery=False,
+                        candidate_limit=10,
+                    )
+                    stored = conn.execute("SELECT COUNT(*) FROM episode").fetchone()[0]
+        self.assertEqual((result.after_filter, result.stored, stored), (10, 10, 10))
+        self.assertEqual(result.dropped["short digest episode cap"], 15)
+
+    def test_short_fetch_skips_already_tagged_rows_before_applying_cap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.make_db(temp_dir)
+            tagged = episode("already-tagged", published_at="2026-01-02T00:00:00+00:00")
+            fresh = episode("fresh", published_at="2026-01-01T00:00:00+00:00")
+            with db.session(path) as conn:
+                tagged_id = fetch.upsert_episodes(conn, [tagged])[0]
+                conn.execute(
+                    "UPDATE episode SET tagged_at=datetime('now'), score=90 WHERE id=?",
+                    (tagged_id,),
+                )
+            with patch.object(fetch, "fetch_feeds", return_value=([tagged, fresh], 2, 0)):
+                with db.session(path) as conn:
+                    run_id = conn.execute("INSERT INTO run DEFAULT VALUES").lastrowid
+                    result = fetch.fetch_all(
+                        conn,
+                        since=0,
+                        run_id=run_id,
+                        refresh_discovery=False,
+                        candidate_limit=1,
+                    )
+        self.assertEqual([row["guid"] for row in result.candidates], ["fresh"])
+
     def test_guid_upsert_updates_without_duplication(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = self.make_db(temp_dir)

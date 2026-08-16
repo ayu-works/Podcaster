@@ -167,12 +167,22 @@ def parse_tags(raw: str, candidate_count: int) -> tuple[dict[int, ParsedTag], in
     return parsed, invalid
 
 
-def load_queue(conn, limit: int | None = None) -> list[sqlite3.Row]:
+def load_queue(
+    conn,
+    limit: int | None = None,
+    episode_ids: list[int] | None = None,
+) -> list[sqlite3.Row]:
     sql = (
         "SELECT * FROM episode WHERE tagged_at IS NULL AND tag_attempts < ? "
-        "ORDER BY published_at DESC, id"
     )
     params: list[int] = [config.TAG_MAX_ATTEMPTS]
+    if episode_ids is not None:
+        if not episode_ids:
+            return []
+        placeholders = ",".join("?" for _ in episode_ids)
+        sql += f" AND id IN ({placeholders})"
+        params.extend(episode_ids)
+    sql += " ORDER BY published_at DESC, id"
     if limit is not None:
         sql += " LIMIT ?"
         params.append(limit)
@@ -324,10 +334,12 @@ def tag_all(
     dry_run: bool = False,
     client: Groq | None = None,
     daily_budget: int | None = None,
+    episode_ids: list[int] | None = None,
+    progress=None,
 ) -> TagResult:
     if not config.GROQ_API_KEY and client is None:
         raise TagError("GROQ_API_KEY missing from .env; tagging cannot run")
-    rows = load_queue(conn, limit)
+    rows = load_queue(conn, limit, episode_ids=episode_ids)
     result = TagResult(selected=len(rows))
     if not rows:
         return result
@@ -404,6 +416,8 @@ def tag_all(
             _write_batch(conn, batch, parsed, result, dry_run)
         if not dry_run:
             conn.commit()
+        if progress is not None:
+            progress(min(start + len(batch), len(rows)), len(rows), result)
         if stop_for_budget:
             break
 

@@ -327,6 +327,9 @@ def fetch_all(
     run_id: int | None = None,
     progress=None,
     refresh_discovery: bool = True,
+    discovery_topics: tuple[str, ...] | None = None,
+    discovery_target: int | None = None,
+    candidate_limit: int | None = None,
 ) -> FetchResult:
     """Fetch the shared universe and leave taggable rows in `episode`.
 
@@ -352,7 +355,11 @@ def fetch_all(
 
     discovered_count = 0
     if refresh_discovery:
-        discovery = discover.discover_recent(window)
+        discovery = discover.discover_recent(
+            window,
+            topic_slugs=discovery_topics,
+            target=discovery_target,
+        )
         # Category discovery is an external HTTP phase. A committed Turso
         # connection may lose its idle stream while those requests run.
         db.ensure_connection(conn)
@@ -377,6 +384,36 @@ def fetch_all(
     # write whose server-side outcome could be uncertain.
     db.ensure_connection(conn)
     candidates, result.dropped = filter_episodes(episodes)
+    if candidate_limit is not None:
+        if candidate_limit < 1:
+            raise ValueError("candidate_limit must be positive")
+        candidate_guids = list({episode.guid for episode in candidates})
+        known: set[str] = set()
+        processable: set[str] = set()
+        for start in range(0, len(candidate_guids), _CHUNK):
+            batch = candidate_guids[start : start + _CHUNK]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT guid, tagged_at, tag_attempts FROM episode "
+                f"WHERE guid IN ({placeholders})",
+                batch,
+            ).fetchall()
+            known.update(row["guid"] for row in rows)
+            processable.update(
+                row["guid"]
+                for row in rows
+                if row["tagged_at"] is None
+                and row["tag_attempts"] < config.TAG_MAX_ATTEMPTS
+            )
+        candidates = [
+            episode
+            for episode in candidates
+            if episode.guid not in known or episode.guid in processable
+        ]
+        dropped_by_cap = max(0, len(candidates) - candidate_limit)
+        if dropped_by_cap:
+            result.dropped["short digest episode cap"] += dropped_by_cap
+        candidates = candidates[:candidate_limit]
     guids = {episode.guid for episode in candidates}
     existing: set[str] = set()
     guid_list = list(guids)

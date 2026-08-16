@@ -75,6 +75,35 @@ class DynamicDiscoveryTests(unittest.TestCase):
         shared = next(feed for feed in result.selected if feed.feed_id == 99_999)
         self.assertEqual(shared.matched_topics, {0, 1})
 
+    def test_short_discovery_queries_only_requested_topics_and_caps_feeds(self):
+        calls = []
+
+        def recent(since, categories, **kwargs):
+            calls.append(categories)
+            base = len(calls) * 100
+            return [
+                {
+                    "id": base + index,
+                    "url": f"https://example.com/{base + index}.xml",
+                    "title": f"Show {base + index}",
+                    "newestItemPubdate": base + index,
+                }
+                for index in range(5)
+            ]
+
+        with patch.object(discover.podcastindex, "recent_feeds", side_effect=recent):
+            result = discover.discover_recent(
+                123,
+                topic_slugs=("design", "science"),
+                target=3,
+            )
+
+        self.assertCountEqual(
+            calls,
+            [config.TOPIC_CATEGORIES["design"], config.TOPIC_CATEGORIES["science"]],
+        )
+        self.assertEqual(len(result.selected), 3)
+
     def test_discovery_cache_preserves_mutes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "discover.db"

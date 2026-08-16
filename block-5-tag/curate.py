@@ -34,6 +34,8 @@ def curate(
     run_id: int,
     previous_cutoff: str | None = None,
     now: datetime | None = None,
+    eligible_episode_ids: list[int] | None = None,
+    min_score: int | None = None,
 ) -> CurateResult:
     """Write at most PICKS_PER_TOPIC, capped per show, for every topic.
 
@@ -57,10 +59,19 @@ def curate(
     # editorial output. Prior runs still exclude an episode via NOT EXISTS.
     conn.execute("DELETE FROM daily_pick WHERE run_id = ?", (run_id,))
     result = CurateResult(run_id=run_id)
+    score_floor = config.RELEVANCE_BAR if min_score is None else min_score
+    eligible_clause = ""
+    eligible_parameters: list[int] = []
+    if eligible_episode_ids is not None:
+        if not eligible_episode_ids:
+            return result
+        placeholders = ",".join("?" for _ in eligible_episode_ids)
+        eligible_clause = f" AND e.id IN ({placeholders})"
+        eligible_parameters = eligible_episode_ids
 
     for topic in config.TOPIC_SLUGS:
         rows = conn.execute(
-            """
+            f"""
             SELECT e.*
             FROM episode e
             JOIN episode_topic t ON t.episode_id = e.id
@@ -74,9 +85,10 @@ def curate(
                   WHERE prior.episode_id = e.id
                     AND prior.run_id <> ?
               )
+              {eligible_clause}
             ORDER BY e.score DESC, e.published_at DESC
             """,
-            (topic, config.RELEVANCE_BAR, lower, staleness_floor, run_id),
+            (topic, score_floor, lower, staleness_floor, run_id, *eligible_parameters),
         ).fetchall()
 
         show_counts: Counter = Counter()

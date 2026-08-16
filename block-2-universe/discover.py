@@ -69,8 +69,25 @@ def balance(feeds: list[DiscoveredFeed], target: int) -> list[DiscoveredFeed]:
     return selected
 
 
-def discover_recent(since: int, client: httpx.Client | None = None) -> DiscoveryResult:
+def discover_recent(
+    since: int,
+    client: httpx.Client | None = None,
+    topic_slugs: tuple[str, ...] | None = None,
+    target: int | None = None,
+) -> DiscoveryResult:
     """Query every product topic, merge feed IDs, then balance to the budget."""
+    selected_slugs = set(topic_slugs or config.TOPIC_SLUGS)
+    unknown = selected_slugs - set(config.TOPIC_SLUGS)
+    if unknown:
+        raise ValueError(f"unknown discovery topics: {sorted(unknown)}")
+    indexed_topics = [
+        (index, topic)
+        for index, topic in enumerate(config.TOPICS)
+        if topic[0] in selected_slugs
+    ]
+    if not indexed_topics:
+        raise ValueError("at least one discovery topic is required")
+
     owned = client is None
     client = client or httpx.Client(timeout=podcastindex.TIMEOUT)
     try:
@@ -86,7 +103,7 @@ def discover_recent(since: int, client: httpx.Client | None = None) -> Discovery
             return index, feeds
 
         with ThreadPoolExecutor(max_workers=config.DISCOVERY_WORKERS) as pool:
-            responses = list(pool.map(query, enumerate(config.TOPICS)))
+            responses = list(pool.map(query, indexed_topics))
     except Exception as exc:
         raise DiscoveryError("Podcast Index recent-category discovery failed") from exc
     finally:
@@ -126,7 +143,10 @@ def discover_recent(since: int, client: httpx.Client | None = None) -> Discovery
             if updated > current.updated_at:
                 current.updated_at = updated
 
-    selected = balance(list(merged.values()), config.DISCOVERY_FEED_TARGET)
+    selected = balance(
+        list(merged.values()),
+        config.DISCOVERY_FEED_TARGET if target is None else target,
+    )
     counts = {
         slug: sum(index in feed.matched_topics for feed in selected)
         for index, slug in enumerate(config.TOPIC_SLUGS)
