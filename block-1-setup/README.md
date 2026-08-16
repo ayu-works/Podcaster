@@ -2,7 +2,8 @@
 
 `config.py` owns every topic, category mapping, limit, path, and environment
 value. `db.py` owns the nine-table shared-pool schema and opens local SQLite or
-remote Turso/libSQL without changing downstream SQL.
+the remote Rust-based Turso Database without changing downstream SQL. Hosted
+connections use Turso's official `turso_serverless` DB-API driver.
 
 ```bash
 cd block-1-setup

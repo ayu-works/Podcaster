@@ -22,4 +22,5 @@ A hidden honeypot and a small per-IP throttle provide light abuse control.
 The repository-root `index.py` exports the app through Vercel's zero-config
 Flask entry point, and the root `requirements.txt` supplies its runtime
 dependencies. `.python-version` keeps Vercel on Python 3.12, the same runtime
-used by GitHub Actions and one with an official `libsql` wheel.
+used by GitHub Actions and supported by the pure-Python `turso_serverless`
+driver.

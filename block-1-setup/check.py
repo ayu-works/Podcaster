@@ -7,11 +7,10 @@ import config
 import db
 
 DEPS = ("httpx", "feedparser", "groq", "jinja2", "resend", "flask", "dotenv")
-# libsql is deliberately NOT in DEPS: it's only required on the remote branch
-# of db.connect(), and there are no Turso credentials yet, so this machine
-# runs the local SQLite fallback. Requiring it here would fail every local
-# check for a package nothing local-only needs. db.connect() itself is what
-# reports libsql problems -- loudly, at connect time -- once it's needed.
+# turso_serverless is deliberately NOT in DEPS: it is only required on the
+# remote branch of db.connect(). Requiring it here would fail a local-only
+# check for a package the SQLite fallback does not need; db.connect() reports
+# remote-driver problems loudly when a hosted database is used.
 
 
 def main() -> int:

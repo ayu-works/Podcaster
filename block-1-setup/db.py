@@ -177,54 +177,49 @@ def connect(url=None, token=None):
     a throwaway file so tests need no network and no shared remote state
     (S2-01c).
 
-    `libsql` is imported lazily, inside the remote branch only. A
-    module-level `import libsql` would make this file -- and therefore
-    every block, since all of them import config/db -- unimportable on a
-    machine that doesn't have the package installed, which is this one.
+    `turso_serverless` is imported lazily, inside the remote branch only.
+    It is Turso's over-the-wire driver for the newer Rust database engine;
+    `libsql` is the corresponding driver for the older libSQL engine. A
+    module-level import would make every local-only block require the remote
+    driver unnecessarily.
     """
     url = config.DATABASE_URL if url is None else url
 
     if isinstance(url, str) and (
         url.startswith("libsql://") or url.startswith("https://")
     ):
-        import libsql  # noqa: local import, see docstring
+        import turso_serverless  # noqa: local import, see docstring
 
-        conn = libsql.connect(url, auth_token=token or config.DATABASE_TOKEN)
+        conn = turso_serverless.connect(
+            url, auth_token=token or config.DATABASE_TOKEN
+        )
+        # The serverless driver implements the DB-API row_factory contract
+        # and ships its own sqlite3.Row-compatible Row type. Downstream code
+        # intentionally uses both positional and named access, plus dict(row).
+        conn.row_factory = turso_serverless.Row
         # Round-trips immediately, so a bad token raises here -- at connect
         # time -- rather than silently at whatever query happens to run
         # first (S2-00). Never wrap this in try/except: the whole point is
         # that a bad credential is loud.
         conn.execute("PRAGMA foreign_keys = ON")
 
-        # Whether libsql.Connection supports dict-style row access the same
-        # way sqlite3.Connection does was unverified at build time -- there
-        # are no Turso credentials to test against yet. table_names() and
-        # last_good_cutoff() below both read rows by column name, and so
-        # does every query in blocks 2-7 -- "every query ports unchanged"
-        # is the entire stated reason for choosing Turso over Postgres
-        # (ARCHITECTURE section 7). So prove it here, at connect time,
-        # rather than let it surface as a silent tuple-index crash the day
-        # credentials arrive. Do not fall back to index access on failure
-        # and do not swallow the error -- an unverifiable driver behaviour
-        # must fail loudly, with the reason named, on the first connection.
+        # Prove the driver's sqlite3-compatible named-row contract on every
+        # new connection. All blocks use row["column"] as well as row[0], so
+        # a driver regression must fail at connection time with a clear error.
         try:
-            conn.row_factory = sqlite3.Row
             probe = conn.execute("SELECT 1 AS one").fetchone()
             probe_ok = probe["one"] == 1
         except Exception as exc:
             raise RuntimeError(
-                "libsql does not support named column access (row['col']) "
-                "the way sqlite3.Row does. table_names(), last_good_cutoff(), "
-                "and every query in blocks 2-7 depend on it -- this must be "
-                "fixed in db.connect() before anything else is built on Turso."
+                "Turso's serverless driver did not provide sqlite3-compatible "
+                "named column access (row['col']). Every query in blocks 2-7 "
+                "depends on that contract."
             ) from exc
         if not probe_ok:
             raise RuntimeError(
-                "libsql row_factory was accepted but named column access "
+                "Turso's row_factory was accepted but named column access "
                 "('SELECT 1 AS one' via row['one']) did not return the "
-                "expected value. table_names(), last_good_cutoff(), and "
-                "every query in blocks 2-7 depend on it -- this must be "
-                "fixed in db.connect() before anything else is built on Turso."
+                "expected value."
             )
 
         return conn

@@ -75,7 +75,7 @@ the shared fetch or another subscriber's digest.
 |---|---|---|
 | Catalogue | Podcast Index API | Recent feed categories and batched feed-ID episode lookup |
 | Tagger | Groq JSON completion | One bounded call per episode batch |
-| Database | SQLite locally, Turso/libSQL hosted | Same SQL and named-row access |
+| Database | SQLite locally, Rust-based Turso Database hosted | Same SQL and named-row access through `turso_serverless` |
 | Digest mail | Resend | API delivery and unsubscribe headers |
 | Onboarding | Flask on Vercel | Immediate serverless signup and links |
 | Scheduler | GitHub Actions | Runs without the owner's computer |

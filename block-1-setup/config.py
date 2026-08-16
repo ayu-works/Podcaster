@@ -198,9 +198,9 @@ SIGNUP_RATE_WINDOW_SEC = 60 * 60
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
-# --- Database (Turso / libSQL, ARCHITECTURE section 7) ----------------------
+# --- Database (Turso, ARCHITECTURE section 7) -------------------------------
 
-# Remote (libsql:// or https://) once a Turso database exists; empty for now,
+# Remote (libsql:// or https://) once a Turso database exists; empty locally,
 # which makes db.connect() fall back to a local SQLite file at DB_PATH. A
 # file:... URL points at a throwaway file instead, for tests (S2-01c).
 DATABASE_URL = os.getenv("DATABASE_URL", "")

@@ -74,6 +74,52 @@ class ConfigTests(unittest.TestCase):
 
 
 class SchemaTests(unittest.TestCase):
+    def test_remote_turso_driver_provides_named_and_positional_rows(self):
+        calls = []
+
+        class FakeRow:
+            def __init__(self, cursor, values):
+                self._values = tuple(values)
+                self._indexes = {
+                    column[0]: index
+                    for index, column in enumerate(cursor.description)
+                }
+
+            def __getitem__(self, key):
+                if isinstance(key, str):
+                    key = self._indexes[key]
+                return self._values[key]
+
+        class FakeCursor:
+            description = (("one", None, None, None, None, None, None),)
+
+            def __init__(self, connection, values=()):
+                self.connection = connection
+                self.values = values
+
+            def fetchone(self):
+                return self.connection.row_factory(self, self.values)
+
+        class FakeConnection:
+            row_factory = None
+
+            def execute(self, sql):
+                if sql == "SELECT 1 AS one":
+                    return FakeCursor(self, (1,))
+                return FakeCursor(self)
+
+        def fake_connect(url, *, auth_token):
+            calls.append((url, auth_token))
+            return FakeConnection()
+
+        fake_driver = SimpleNamespace(connect=fake_connect, Row=FakeRow)
+        with patch.dict(sys.modules, {"turso_serverless": fake_driver}):
+            conn = db.connect("libsql://podcaster.example", token="token")
+
+        self.assertEqual(calls, [("libsql://podcaster.example", "token")])
+        row = conn.execute("SELECT 1 AS one").fetchone()
+        self.assertEqual((row[0], row["one"]), (1, 1))
+
     def test_schema_is_idempotent_and_clock_uses_only_good_cutoffs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "schema.db"
