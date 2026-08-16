@@ -13,7 +13,7 @@ from pathlib import Path
 import resend
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from _shared import config, db
+from _shared import config, db, links
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
@@ -129,6 +129,12 @@ def render(picks: list[dict], token: str) -> str:
             "reason": pick["why"],
             "duration": format_duration(pick["duration_sec"]),
             "published": _pretty_date(pick["published_at"]),
+            # The last guard before an irreversible send. `web_url` is already
+            # a page URL at ingest, but rows predating that fix hold enclosure
+            # URLs, and no digest may link a listener to a bare audio file.
+            # Empty means the template prints the title with no link and no
+            # button, which is the correct degradation.
+            "listen_url": links.safe_page_url(pick["web_url"]),
         }
         by_topic.setdefault(pick["topic"], []).append(item)
     for slug, items in by_topic.items():

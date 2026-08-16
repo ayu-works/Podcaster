@@ -33,7 +33,7 @@ from pathlib import Path
 
 import httpx
 
-from _shared import config, db
+from _shared import config, db, links
 import discover
 import podcastindex
 
@@ -148,7 +148,14 @@ def to_episode(item: dict, fallback_show: str) -> NewEpisode | None:
             if published
             else None
         ),
-        web_url=item.get("link") or item.get("enclosureUrl") or "",
+        # Never `enclosureUrl`: that is the audio file, and roughly half of
+        # recent episodes carry no `link`, so an "or" fallback made the raw
+        # media URL the majority case. See block-1-setup/links.py.
+        web_url=links.episode_page_url(
+            item.get("link"),
+            itunes_id=item.get("feedItunesId"),
+            enclosure_url=item.get("enclosureUrl"),
+        ),
     )
 
 
@@ -277,6 +284,34 @@ def upsert_episodes(conn, episodes: list[NewEpisode]) -> list[int]:
             )
         ]
     return ids
+
+
+def repair_media_links(conn, chunk: int = _CHUNK) -> tuple[int, int]:
+    """Blank stored links that point at audio files. Returns (scanned, cleared).
+
+    Rows written before the link fix used `enclosureUrl` whenever a feed
+    omitted `link`, which was most episodes. Those rows are still taggable and
+    still curatable, so the pipeline must not be able to email them.
+
+    There is no episode page to recover offline: the feed's `link` was empty
+    and the iTunes id was never stored, so the honest repair is to blank the
+    column and let the digest print an unlinked title. Any episode re-seen
+    inside a later fetch window is repopulated correctly by `upsert_episodes`.
+
+    Idempotent, and safe to run before every digest.
+    """
+    rows = conn.execute(
+        "SELECT id, web_url FROM episode WHERE web_url IS NOT NULL AND web_url <> ''"
+    ).fetchall()
+    broken = [row["id"] for row in rows if not links.is_page_url(row["web_url"])]
+    for start in range(0, len(broken), chunk):
+        batch = broken[start : start + chunk]
+        placeholders = ",".join("?" for _ in batch)
+        conn.execute(
+            f"UPDATE episode SET web_url = '' WHERE id IN ({placeholders})", batch
+        )
+    conn.commit()
+    return len(rows), len(broken)
 
 
 # --- stage 2: filter ---------------------------------------------------------

@@ -18,5 +18,6 @@ for _folder in ("block-2-universe", "block-1-setup"):
 
 import config  # noqa: E402
 import db  # noqa: E402
+import links  # noqa: E402
 
-__all__ = ["config", "db"]
+__all__ = ["config", "db", "links"]

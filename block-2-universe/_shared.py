@@ -11,5 +11,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "block-1
 
 import config  # noqa: E402
 import db  # noqa: E402
+import links  # noqa: E402
 
-__all__ = ["config", "db"]
+__all__ = ["config", "db", "links"]

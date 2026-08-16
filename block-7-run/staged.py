@@ -57,6 +57,18 @@ def check_stage(conn) -> dict:
     return {"database": "ok", "tables_checked": len(required)}
 
 
+def repair_stage(conn) -> dict:
+    """Blank any stored link that points at audio rather than a webpage.
+
+    Runs before the run is created, so a digest can never curate or send a row
+    left behind by the pre-fix ingest. Idempotent and cheap: one scan plus one
+    bounded update per chunk, and nothing to do once the pool is clean.
+    """
+    db.ensure_connection(conn)
+    scanned, cleared = fetch.repair_media_links(conn)
+    return {"scanned": scanned, "cleared": cleared}
+
+
 def start_stage(conn) -> dict:
     run_id = conn.execute("INSERT INTO run DEFAULT VALUES").lastrowid
     conn.commit()
@@ -170,6 +182,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="stage", required=True)
     subparsers.add_parser("check")
+    subparsers.add_parser("repair")
     start = subparsers.add_parser("start")
     start.add_argument("--github-output")
     for name in ("fetch", "curate", "fail"):
@@ -186,6 +199,8 @@ def main() -> int:
     with db.session() as conn:
         if args.stage == "check":
             result = check_stage(conn)
+        elif args.stage == "repair":
+            result = repair_stage(conn)
         elif args.stage == "start":
             result = start_stage(conn)
             _write_github_output(args.github_output, result)

@@ -32,6 +32,15 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
 
+      # Rows stored before the link fix hold enclosure URLs in web_url. They
+      # remain taggable and curatable, so they are cleaned before this run can
+      # select them. Idempotent, and a no-op once the pool is clean.
+      - name: Repair legacy audio links
+        run: timeout --signal=TERM --kill-after=5s 60s python block-7-run/staged.py repair
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
+
       - name: Start run
         id: start
         run: timeout --signal=TERM --kill-after=5s 30s python block-7-run/staged.py start --github-output "$GITHUB_OUTPUT"

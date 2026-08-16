@@ -6,7 +6,7 @@ Run automated coverage with:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The suite currently contains 52 passing tests. External calls are mocked;
+The suite currently contains 85 passing tests. External calls are mocked;
 separate live gates are listed at the end.
 
 ## S1–S2: config, schema, and clock
@@ -72,6 +72,12 @@ case study, or number actually present in the supplied description.
 - Escaping, duration, listen URL, unsubscribe URL, 600px width, no images, and
   the 102KB ceiling are checked.
 - One-click unsubscribe headers are present.
+- The canonical episode page is preferred as `web_url`; an audio enclosure is
+  never stored, including when a feed copies it into `link`.
+- An episode with no page falls back to the show's Apple page, then to no link.
+- A rendered title and CTA never point at an MP3/M4A or other media file, even
+  when the stored row predates the rule; the title still renders unlinked.
+- Repairing legacy rows clears only media URLs and is idempotent.
 
 Manual gate: open a real digest on a phone and decide whether at least one
 episode is genuinely worth playing.

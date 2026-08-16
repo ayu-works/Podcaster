@@ -145,6 +145,15 @@ The digest is grouped by topic and uses a 600px table, inline CSS, escaped
 catalogue text, no external images, a tokenized unsubscribe link, and
 `List-Unsubscribe`/`List-Unsubscribe-Post` headers.
 
+Every link must open a page a human can read. Podcast Index returns the
+episode webpage in `link` and the audio file in `enclosureUrl`, and only the
+first may reach `episode.web_url`. About half of recent episodes carry no
+`link`, so `block-1-setup/links.py` falls back to the show's Apple page built
+from `feedItunesId`, and then to no link at all — never to the enclosure.
+`safe_page_url()` repeats the check at render time, because rows written
+before this rule still hold audio URLs; the guarantee that matters is that no
+enclosure is ever *sent*, not merely that none is stored.
+
 ## 7. Hosted security and failure behavior
 
 New subscribers are `pending`. Only a confirmation link makes them `active`,
