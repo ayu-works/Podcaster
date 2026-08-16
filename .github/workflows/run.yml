@@ -9,6 +9,10 @@ on:
         description: "Optional exact active subscriber; blank sends to all"
         type: string
         default: ""
+      tag_limit:
+        description: "Maximum episodes to tag in this run"
+        type: number
+        default: 100
 
 concurrency:
   group: podcaster-pipeline
@@ -56,9 +60,20 @@ jobs:
           PODCASTINDEX_KEY: ${{ secrets.PODCASTINDEX_KEY }}
           PODCASTINDEX_SECRET: ${{ secrets.PODCASTINDEX_SECRET }}
 
-      - name: Tag at most 100 episodes
-        run: timeout --signal=TERM --kill-after=5s 240s python block-7-run/staged.py tag --run-id "${{ steps.start.outputs.run_id }}" --limit 100
+      - name: Tag the newest queued episodes
+        run: |
+          limit=100
+          if [[ -n "$INPUT_TAG_LIMIT" ]]; then
+            if [[ ! "$INPUT_TAG_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+              echo "tag_limit must be a positive integer" >&2
+              exit 1
+            fi
+            limit="$INPUT_TAG_LIMIT"
+          fi
+          args=(python block-7-run/staged.py tag --run-id "${{ steps.start.outputs.run_id }}" --limit "$limit")
+          timeout --signal=TERM --kill-after=5s 240s "${args[@]}"
         env:
+          INPUT_TAG_LIMIT: ${{ inputs.tag_limit }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DATABASE_TOKEN: ${{ secrets.DATABASE_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

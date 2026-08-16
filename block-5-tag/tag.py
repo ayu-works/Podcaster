@@ -61,6 +61,10 @@ class BudgetExhausted(RuntimeError):
     """The daily token budget cannot safely fit another call."""
 
 
+class DeadlineReached(RuntimeError):
+    """The remaining wall clock cannot safely fit another call."""
+
+
 @dataclass
 class ParsedTag:
     index: int
@@ -81,6 +85,7 @@ class TagResult:
     untagged_left: int = 0
     tokens_used: int = 0
     budget_exhausted: bool = False
+    deadline_reached: bool = False
     rows: list[tuple[int, int, list[str], str]] = field(default_factory=list)
 
 
@@ -90,6 +95,18 @@ class CallState:
     last_call_at: float | None = None
     last_call_tokens: int = 0
     attempts: dict[int, int] = field(default_factory=dict)
+    # Monotonic instant after which no further call may start, and how long the
+    # slowest batch so far actually took. Measured rather than assumed: pacing
+    # and model latency both vary by an order of magnitude between runs.
+    #
+    # The slowest batch, not the most recent one, because the estimate only has
+    # to be right in one direction. One quick batch would otherwise shrink the
+    # estimate enough to admit a slow batch that runs past the step timeout —
+    # the exact death this deadline exists to prevent. Overestimating merely
+    # ends the stage an batch early, which costs a few episodes; underestimating
+    # costs the whole digest.
+    deadline: float | None = None
+    slowest_batch_seconds: float = 0.0
 
 
 def format_duration(seconds: int | None) -> str:
@@ -198,9 +215,16 @@ def _pace(state: CallState) -> None:
     if state.last_call_at is None or state.last_call_tokens <= 0:
         return
     interval = state.last_call_tokens / config.GROQ_TPM * 60
-    remaining = interval - (time.monotonic() - state.last_call_at)
-    if remaining > 0:
-        time.sleep(remaining)
+    now = time.monotonic()
+    remaining = interval - (now - state.last_call_at)
+    if remaining <= 0:
+        return
+    # Sleeping past the deadline would spend the whole margin waiting and then
+    # start a call that cannot finish. Stop instead, so the caller keeps what
+    # is already committed.
+    if state.deadline is not None and now + remaining > state.deadline:
+        raise DeadlineReached
+    time.sleep(remaining)
 
 
 def _retry_after(exc: APIStatusError) -> float:
@@ -382,9 +406,11 @@ def tag_all(
     progress=None,
     request_progress=None,
     request_timeout_seconds: float | None = None,
+    deadline_seconds: float | None = None,
 ) -> TagResult:
     if not config.GROQ_API_KEY and client is None:
         raise TagError("GROQ_API_KEY missing from .env; tagging cannot run")
+    started_at = time.monotonic()
     rows = load_queue(conn, limit, episode_ids=episode_ids)
     result = TagResult(selected=len(rows))
     if not rows:
@@ -401,10 +427,25 @@ def tag_all(
         ),
     )
     budget = config.GROQ_TPD if daily_budget is None else daily_budget
-    state = CallState()
+    if deadline_seconds is None:
+        deadline_seconds = config.TAG_DEADLINE_SECONDS
+    state = CallState(
+        deadline=started_at + deadline_seconds if deadline_seconds > 0 else None
+    )
 
     for start in range(0, len(rows), config.TAG_BATCH_SIZE):
         batch = rows[start : start + config.TAG_BATCH_SIZE]
+        # The first batch always runs. A pessimistic estimate that returns zero
+        # tagged episodes is worse than one call that overshoots, because the
+        # margin exists precisely to absorb the overshoot.
+        if (
+            start
+            and state.deadline is not None
+            and time.monotonic() + state.slowest_batch_seconds > state.deadline
+        ):
+            result.deadline_reached = True
+            break
+        batch_started_at = time.monotonic()
         prompt = build_prompt(batch)
         if state.tokens_used + estimate_call_tokens(prompt) > budget:
             result.budget_exhausted = True
@@ -418,6 +459,7 @@ def tag_all(
         parse_error: Exception | None = None
         attempts_before = sum(state.attempts.values())
         stop_for_budget = False
+        stop_for_deadline = False
         for parse_attempt in range(2):
             try:
                 raw = _call(
@@ -437,6 +479,10 @@ def tag_all(
                 result.budget_exhausted = True
                 stop_for_budget = True
                 break
+            except DeadlineReached:
+                result.deadline_reached = True
+                stop_for_deadline = True
+                break
             except AttemptsExhausted:
                 break
             except (json.JSONDecodeError, ValueError) as exc:
@@ -451,7 +497,10 @@ def tag_all(
         if parsed is None:
             if parse_error is not None:
                 result.parse_failed += len(batch)
-            if not dry_run:
+            # A batch the clock stopped before it began has nothing wrong with
+            # it; stamping an error would make the next run's queue look like a
+            # quality problem rather than a short morning.
+            if not dry_run and not (stop_for_deadline and parse_error is None):
                 _set_batch_error(
                     conn,
                     batch,
@@ -465,8 +514,11 @@ def tag_all(
             conn.commit()
         if progress is not None:
             progress(min(start + len(batch), len(rows)), len(rows), result)
-        if stop_for_budget:
+        if stop_for_budget or stop_for_deadline:
             break
+        state.slowest_batch_seconds = max(
+            state.slowest_batch_seconds, time.monotonic() - batch_started_at
+        )
 
     result.tokens_used = state.tokens_used
     if not dry_run and episode_ids is not None:
@@ -509,6 +561,8 @@ def main() -> int:
     )
     if result.budget_exhausted:
         print("daily token budget reached; remainder left untouched for the next run")
+    if result.deadline_reached:
+        print("tagging deadline reached; remainder left untouched for the next run")
     for episode_id, score, topics, why in result.rows[:20]:
         print(f"{episode_id:>6}  {score:>3}  {','.join(topics) or '-'}  {why}")
     return 0

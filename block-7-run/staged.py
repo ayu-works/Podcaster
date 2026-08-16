@@ -111,6 +111,7 @@ def tag_stage(conn, run_id: int, limit: int = MAX_TAG_LIMIT) -> dict:
         result = tag.tag_all(
             conn,
             limit=limit,
+            deadline_seconds=config.TAG_DEADLINE_SECONDS,
             progress=lambda completed, total, current: print(
                 f"tag progress episodes={completed}/{total} "
                 f"tagged={current.tagged} tokens={current.tokens_used}",
@@ -125,6 +126,7 @@ def tag_stage(conn, run_id: int, limit: int = MAX_TAG_LIMIT) -> dict:
             "tagged": result.tagged,
             "tokens": result.tokens_used,
             "untagged_left": result.untagged_left,
+            "deadline_reached": result.deadline_reached,
         }
     except Exception:
         _mark_failed(conn, run_id)

@@ -124,8 +124,13 @@ response contains 0–3 known topic slugs, a 0–100 score, and one reason groun
 in the supplied description. Unknown slugs are discarded. Generic reasons are
 failed outputs and retry within the attempt limit.
 
-Pace against `GROQ_TPM` and stop cleanly before `GROQ_TPD`. An unfinished
-queue is visible in run metrics and resumes later.
+Pace against `GROQ_TPM` and stop cleanly before `GROQ_TPD`. Stop cleanly before
+`TAG_DEADLINE_SECONDS` too, estimating the next batch from the slowest batch
+observed so far: the hosted step is killed at 240s, and a killed stage takes
+Curate and Send with it, so a slow morning must yield a smaller digest rather
+than none. The estimate only has to be right in one direction — ending a batch
+early costs a few episodes, overrunning costs the digest. At least one batch
+always runs. An unfinished queue is visible in run metrics and resumes later.
 
 ### Stage 3 — curate
 

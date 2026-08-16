@@ -263,7 +263,7 @@ class RunTests(unittest.TestCase):
         for stage in (
             "Start run",
             "Fetch 240 dynamically discovered feeds",
-            "Tag at most 100 episodes",
+            "Tag the newest queued episodes",
             "Curate shared topic lists",
             "Send subscriber digests",
             "Mark interrupted run failed",
@@ -378,6 +378,7 @@ class RunTests(unittest.TestCase):
                 tagged=80,
                 tokens_used=1000,
                 untagged_left=20,
+                deadline_reached=False,
             )
             with patch.object(staged.fetch, "fetch_all", side_effect=fetch_fake), patch.object(
                 staged.tag, "tag_all", return_value=tag_result

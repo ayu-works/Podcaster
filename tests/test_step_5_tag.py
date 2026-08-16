@@ -41,6 +41,52 @@ class FakeGroq:
         )
 
 
+class FakeClock:
+    """Monotonic time the test owns, so deadline gates need no real waiting.
+
+    `tick` charges every read, which is how a test can put the deadline in the
+    past before the first batch is even considered.
+    """
+
+    def __init__(self, start: float = 1_000.0, tick: float = 0.0):
+        self.now = start
+        self.tick = tick
+
+    def monotonic(self) -> float:
+        current = self.now
+        self.now += self.tick
+        return current
+
+
+class ClockedGroq(FakeGroq):
+    """FakeGroq that charges each call a fixed amount of fake wall clock."""
+
+    def __init__(self, responses, clock: FakeClock, seconds: float):
+        super().__init__(responses)
+        self.clock = clock
+        self.seconds = seconds
+
+    def create(self, **kwargs):
+        self.clock.now += self.seconds
+        return super().create(**kwargs)
+
+
+class VaryingClockedGroq(ClockedGroq):
+    """ClockedGroq whose successive calls cost different amounts of clock.
+
+    Lets a test tell apart the two possible deadline estimates: the slowest
+    batch seen so far, or merely the most recent one.
+    """
+
+    def __init__(self, responses, clock: FakeClock, schedule: list[float]):
+        super().__init__(responses, clock, 0.0)
+        self.schedule = list(schedule)
+
+    def create(self, **kwargs):
+        self.seconds = self.schedule[min(self.calls, len(self.schedule) - 1)]
+        return super().create(**kwargs)
+
+
 def payload(entries) -> str:
     return json.dumps({"episodes": entries})
 
@@ -89,6 +135,33 @@ class TagTests(unittest.TestCase):
             db.session(self.path) as conn,
         ):
             return tag.tag_all(conn, client=client, **kwargs)
+
+    def run_tag_clocked(self, responses, clock, seconds, **kwargs):
+        """Run tagging on a fake clock and hand back the result and the double."""
+        client = ClockedGroq(responses, clock, seconds)
+        with patch.object(tag.time, "monotonic", clock.monotonic):
+            return self.run_tag(client, **kwargs), client
+
+    def full_batches(self, count: int) -> list[str]:
+        return [
+            payload(
+                [valid_entry(index) for index in range(1, config.TAG_BATCH_SIZE + 1)]
+            )
+            for _ in range(count)
+        ]
+
+    def episode_state(self, episode_id: int):
+        with db.session(self.path) as conn:
+            return conn.execute(
+                "SELECT tagged_at, tag_attempts, tag_error FROM episode WHERE id=?",
+                (episode_id,),
+            ).fetchone()
+
+    def tagged_count(self) -> int:
+        with db.session(self.path) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM episode WHERE tagged_at IS NOT NULL"
+            ).fetchone()[0]
 
     def test_valid_response_writes_score_topics_and_attempt(self):
         episode_id = self.add_episodes(1)[0]
@@ -243,6 +316,107 @@ class TagTests(unittest.TestCase):
 
         self.assertEqual(result.tagged, 10)
         self.assertEqual(requests, [(1, 1)])
+
+    def test_expired_deadline_still_runs_one_batch(self):
+        ids = self.add_episodes(config.TAG_BATCH_SIZE + 1)
+        # The clock is already past the deadline when the first batch is
+        # considered, and one batch must still run.
+        clock = FakeClock(tick=1.0)
+        result, client = self.run_tag_clocked(
+            self.full_batches(1) + [payload([valid_entry(1)])],
+            clock,
+            seconds=1.0,
+            deadline_seconds=0.5,
+        )
+        self.assertTrue(result.deadline_reached)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual((result.tagged, self.tagged_count()), (20, 20))
+        self.assertIsNone(self.episode_state(ids[-1])["tagged_at"])
+
+    def test_deadline_keeps_finished_batches_and_requeues_the_rest(self):
+        ids = self.add_episodes(2 * config.TAG_BATCH_SIZE + 1)
+        clock = FakeClock()
+        result, client = self.run_tag_clocked(
+            self.full_batches(2) + [payload([valid_entry(1)])],
+            clock,
+            seconds=1.0,
+            deadline_seconds=2.5,
+        )
+        self.assertTrue(result.deadline_reached)
+        self.assertFalse(result.budget_exhausted)
+        self.assertEqual(client.calls, 2)
+
+        # Two batches committed and stay committed; the third is untouched, so
+        # it is still queue work rather than a failure the next run must retry.
+        self.assertEqual((result.tagged, self.tagged_count()), (40, 40))
+        skipped = self.episode_state(ids[-1])
+        self.assertIsNone(skipped["tagged_at"])
+        self.assertEqual((skipped["tag_attempts"], skipped["tag_error"]), (0, None))
+        self.assertEqual(result.untagged_left, 1)
+
+    def test_estimate_follows_the_slowest_batch_not_the_most_recent(self):
+        """One quick batch must not admit a slow batch that overruns the step.
+
+        Batches cost 8s then 1s against a 16s deadline. Estimating from the
+        slowest batch stops after two calls; estimating from the most recent
+        one would see a 1s batch, admit a third call, and run past the wall
+        that killed the stage in production.
+        """
+        self.add_episodes(3 * config.TAG_BATCH_SIZE)
+        clock = FakeClock()
+        client = VaryingClockedGroq(self.full_batches(3), clock, [8.0, 1.0, 8.0])
+        with patch.object(tag.time, "monotonic", clock.monotonic):
+            result = self.run_tag(client, deadline_seconds=16)
+
+        self.assertTrue(result.deadline_reached)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual((result.tagged, self.tagged_count()), (40, 40))
+        self.assertEqual(result.untagged_left, config.TAG_BATCH_SIZE)
+
+    def test_pacing_sleep_stops_rather_than_crossing_the_deadline(self):
+        ids = self.add_episodes(config.TAG_BATCH_SIZE + 1)
+        clock = FakeClock()
+        # One token-per-second tier makes the pacing interval, not the batch
+        # estimate, the thing that would overrun the deadline.
+        with patch.object(config, "GROQ_TPM", 60):
+            result, client = self.run_tag_clocked(
+                self.full_batches(1) + [payload([valid_entry(1)])],
+                clock,
+                seconds=1.0,
+                deadline_seconds=50,
+            )
+        self.assertTrue(result.deadline_reached)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(self.tagged_count(), 20)
+        skipped = self.episode_state(ids[-1])
+        self.assertEqual((skipped["tag_attempts"], skipped["tag_error"]), (0, None))
+
+    def test_zero_deadline_disables_the_gate_entirely(self):
+        self.add_episodes(2 * config.TAG_BATCH_SIZE + 1)
+        clock = FakeClock()
+        result, client = self.run_tag_clocked(
+            self.full_batches(2) + [payload([valid_entry(1)])],
+            clock,
+            seconds=10_000.0,
+            deadline_seconds=0,
+        )
+        self.assertFalse(result.deadline_reached)
+        self.assertEqual(client.calls, 3)
+        self.assertEqual((result.tagged, self.tagged_count()), (41, 41))
+
+    def test_budget_and_deadline_are_independent_outcomes(self):
+        self.add_episodes(config.TAG_BATCH_SIZE + 1)
+        clock = FakeClock()
+        result, client = self.run_tag_clocked(
+            self.full_batches(1) + [payload([valid_entry(1)])],
+            clock,
+            seconds=1.0,
+            deadline_seconds=0,
+            daily_budget=1,
+        )
+        self.assertTrue(result.budget_exhausted)
+        self.assertFalse(result.deadline_reached)
+        self.assertEqual((client.calls, self.tagged_count()), (0, 0))
 
 
 if __name__ == "__main__":

@@ -109,6 +109,14 @@ TAG_REASONING_EFFORT = "medium"
 # like a transient backlog rather than a permanent one.
 TAG_MAX_ATTEMPTS = 3
 
+# Wall clock one tagging stage may occupy before it stops on its own terms.
+# The hosted Tag step is killed at 240s, and a killed stage takes Curate and
+# Send with it, so a slow morning produces no digest at all rather than a short
+# one. Stopping voluntarily with roughly 45s of margin keeps every committed
+# batch, leaves the remainder in the queue, and lets the rest of the pipeline
+# run. Raise this only alongside the workflow timeout it sits inside.
+TAG_DEADLINE_SECONDS = 195
+
 MIN_DESC_CHARS = 100
 DESC_TRUNCATE = 400
 MAX_LOOKBACK_DAYS = 5
