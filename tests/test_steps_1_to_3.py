@@ -74,6 +74,28 @@ class ConfigTests(unittest.TestCase):
 
 
 class SchemaTests(unittest.TestCase):
+    def test_bulk_values_groups_remote_round_trips_and_keeps_parameters_bound(self):
+        calls = []
+
+        class RecordingConnection:
+            def execute(self, sql, parameters):
+                calls.append((sql, parameters))
+
+        rows = [(index, f"row-{index}") for index in range(160)]
+        db.execute_values(
+            RecordingConnection(),
+            "INSERT INTO sample (id, label) VALUES {values}",
+            rows,
+        )
+
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(len(parameters) <= 150 for _, parameters in calls))
+        self.assertTrue(all("{values}" not in sql for sql, _ in calls))
+        self.assertEqual(
+            [value for _, parameters in calls for value in parameters],
+            [value for row in rows for value in row],
+        )
+
     def test_remote_turso_driver_provides_named_and_positional_rows(self):
         calls = []
 

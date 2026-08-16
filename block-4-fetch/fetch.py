@@ -243,11 +243,12 @@ def upsert_episodes(conn, episodes: list[NewEpisode]) -> list[int]:
     if not episodes:
         return []
 
-    conn.executemany(
+    db.execute_values(
+        conn,
         """
         INSERT INTO episode
             (guid, feed_id, show_name, title, description, duration_sec, published_at, web_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES {values}
         ON CONFLICT (guid) DO UPDATE SET
             title        = excluded.title,
             description  = excluded.description,

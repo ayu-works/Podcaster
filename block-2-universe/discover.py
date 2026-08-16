@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import httpx
 
 import podcastindex
-from _shared import config
+from _shared import config, db
 
 
 class DiscoveryError(RuntimeError):
@@ -138,10 +138,11 @@ def save_discovered(conn, feeds: list[DiscoveredFeed]) -> None:
     """Upsert the discovery cache while retaining prior mute decisions."""
     if not feeds:
         return
-    conn.executemany(
+    db.execute_values(
+        conn,
         """
         INSERT INTO show (feed_id, feed_url, title)
-        VALUES (?, ?, ?)
+        VALUES {values}
         ON CONFLICT (feed_id) DO UPDATE SET
             feed_url = excluded.feed_url,
             title = excluded.title
@@ -156,8 +157,9 @@ def save_discovered(conn, feeds: list[DiscoveredFeed]) -> None:
             f"SELECT id, feed_id FROM show WHERE feed_id IN ({placeholders})", feed_ids
         ).fetchall()
     }
-    conn.executemany(
-        "INSERT OR IGNORE INTO show_topic (show_id, topic) VALUES (?, ?)",
+    db.execute_values(
+        conn,
+        "INSERT OR IGNORE INTO show_topic (show_id, topic) VALUES {values}",
         [
             (ids[feed.feed_id], config.TOPIC_SLUGS[index])
             for feed in feeds

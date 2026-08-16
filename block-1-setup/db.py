@@ -165,6 +165,38 @@ TABLES = (
     "sent",
 )
 
+# Keep parameter counts below SQLite's traditional 999-variable ceiling even
+# for the widest production insert (episode has eight bound columns). More
+# importantly, a hosted Turso connection turns each statement into one HTTP
+# request, so grouping rows avoids hundreds of sequential network round trips.
+BULK_ROWS_PER_STATEMENT = 75
+
+
+def execute_values(conn, sql: str, rows, chunk_size: int = BULK_ROWS_PER_STATEMENT):
+    """Execute a parameterized multi-row statement in bounded chunks.
+
+    ``sql`` must contain exactly one ``{values}`` marker where the generated
+    ``(?, ...), (?, ...)`` list belongs. Values remain bound parameters; they
+    are never interpolated into SQL.
+    """
+    values = [tuple(row) for row in rows]
+    if not values:
+        return
+    if sql.count("{values}") != 1:
+        raise ValueError("bulk SQL must contain exactly one {values} marker")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+
+    width = len(values[0])
+    if width < 1 or any(len(row) != width for row in values):
+        raise ValueError("bulk rows must be non-empty and have equal width")
+    row_placeholder = f"({','.join('?' for _ in range(width))})"
+    for start in range(0, len(values), chunk_size):
+        batch = values[start : start + chunk_size]
+        placeholders = ",".join(row_placeholder for _ in batch)
+        parameters = [value for row in batch for value in row]
+        conn.execute(sql.replace("{values}", placeholders), parameters)
+
 
 def connect(url=None, token=None):
     """Open a connection: Turso when `url` (or config.DATABASE_URL) is a
