@@ -139,10 +139,16 @@ class DynamicDiscoveryTests(unittest.TestCase):
                 with (
                     patch.object(fetch.discover, "discover_recent", return_value=discovery),
                     patch.object(fetch, "fetch_feeds", return_value=([], 0, 0)),
+                    patch.object(
+                        fetch.db,
+                        "ensure_connection",
+                        wraps=fetch.db.ensure_connection,
+                    ) as refresh,
                 ):
                     result = fetch.fetch_all(conn, since=123, run_id=run_id)
             self.assertEqual(result.discovered, 12)
             self.assertEqual(result.shows, 1)
+            self.assertEqual(refresh.call_count, 2)
 
 
 if __name__ == "__main__":

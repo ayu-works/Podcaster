@@ -193,6 +193,24 @@ class TagTests(unittest.TestCase):
         self.assertEqual(final["tag_attempts"], 1)
         self.assertIn("provider down", final["tag_error"])
 
+    def test_attempt_is_committed_before_waiting_for_groq(self):
+        episode_id = self.add_episodes(1)[0]
+        observed_attempts = []
+
+        class ObservingGroq(FakeGroq):
+            def create(inner_self, **kwargs):
+                with db.session(self.path) as observer:
+                    observed_attempts.append(
+                        observer.execute(
+                            "SELECT tag_attempts FROM episode WHERE id=?",
+                            (episode_id,),
+                        ).fetchone()[0]
+                    )
+                return super().create(**kwargs)
+
+        self.run_tag(ObservingGroq([payload([valid_entry(1)])]))
+        self.assertEqual(observed_attempts, [1])
+
 
 if __name__ == "__main__":
     unittest.main()

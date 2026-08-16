@@ -273,15 +273,37 @@ def connect(url=None, token=None):
     return conn
 
 
+def ensure_connection(conn) -> None:
+    """Refresh a Turso serverless stream after a long idle network call.
+
+    Turso's HTTP driver clears its stale stream state when the server reports
+    ``stream not found``. Retrying only this harmless read is safe: unlike a
+    write, it cannot duplicate application data if the first request's outcome
+    is uncertain. Local SQLite connections simply execute the read once.
+    """
+    try:
+        conn.execute("SELECT 1").fetchone()
+    except Exception as exc:
+        if "stream not found" not in str(exc).casefold():
+            raise
+        conn.execute("SELECT 1").fetchone()
+
+
 @contextmanager
 def session(path=None):
-    """Connection that commits on success and rolls back on error."""
+    """Connection that commits on success without masking body exceptions."""
     conn = connect(path)
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        # A remote stream may already have expired. If rollback then fails,
+        # preserve the exception raised by the actual operation instead of
+        # replacing it with a misleading cleanup traceback.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
         conn.close()

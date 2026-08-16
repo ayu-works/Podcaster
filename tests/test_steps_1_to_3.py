@@ -74,6 +74,55 @@ class ConfigTests(unittest.TestCase):
 
 
 class SchemaTests(unittest.TestCase):
+    def test_stale_remote_stream_is_refreshed_with_one_safe_read_retry(self):
+        class Cursor:
+            @staticmethod
+            def fetchone():
+                return (1,)
+
+        class StaleOnceConnection:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, sql):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("HTTP status 404: stream not found")
+                return Cursor()
+
+        conn = StaleOnceConnection()
+        db.ensure_connection(conn)
+        self.assertEqual(conn.calls, 2)
+
+    def test_connection_refresh_does_not_retry_unrelated_errors(self):
+        class BrokenConnection:
+            calls = 0
+
+            def execute(self, sql):
+                self.calls += 1
+                raise RuntimeError("permission denied")
+
+        conn = BrokenConnection()
+        with self.assertRaisesRegex(RuntimeError, "permission denied"):
+            db.ensure_connection(conn)
+        self.assertEqual(conn.calls, 1)
+
+    def test_session_rollback_failure_preserves_body_exception(self):
+        class RollbackFailingConnection:
+            def commit(self):
+                pass
+
+            def rollback(self):
+                raise RuntimeError("cleanup stream expired")
+
+            def close(self):
+                pass
+
+        with patch.object(db, "connect", return_value=RollbackFailingConnection()):
+            with self.assertRaisesRegex(ValueError, "original body failure"):
+                with db.session():
+                    raise ValueError("original body failure")
+
     def test_bulk_values_groups_remote_round_trips_and_keeps_parameters_bound(self):
         calls = []
 

@@ -79,6 +79,14 @@ def _queue_counts(conn) -> tuple[int, int]:
     return untagged, abandoned
 
 
+def _safe_rollback(conn) -> None:
+    """Best-effort cleanup that must not replace the pipeline exception."""
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
 def execute(
     conn,
     *,
@@ -137,6 +145,11 @@ def execute(
                 "SELECT fetch_cutoff_at FROM run WHERE id=?", (run_id,)
             ).fetchone()[0]
 
+        # Fetching performs many writes. Finish that transaction before the
+        # slower Groq stage so concurrent writers are not blocked and Turso
+        # does not have to retain a transaction stream during model calls.
+        conn.commit()
+
         stage = "tag"
         if skip_tag:
             metrics.untagged_left, metrics.tag_abandoned = _queue_counts(conn)
@@ -186,18 +199,28 @@ def execute(
             )
             conn.commit()
     except Exception:
-        conn.rollback()
+        _safe_rollback(conn)
         metrics.status = "failed"
         metrics.failed_stage = stage
         if mutable_status:
-            conn.execute(
-                "UPDATE run SET fetched=?, tagged=?, status='failed', "
-                "finished_at=datetime('now') WHERE id=?",
-                (metrics.fetched, metrics.tagged, run_id),
-            )
-            conn.commit()
-        metrics.untagged_left, metrics.tag_abandoned = _queue_counts(conn)
-        _append_log(metrics)
+            try:
+                db.ensure_connection(conn)
+                conn.execute(
+                    "UPDATE run SET fetched=?, tagged=?, status='failed', "
+                    "finished_at=datetime('now') WHERE id=?",
+                    (metrics.fetched, metrics.tagged, run_id),
+                )
+                conn.commit()
+            except Exception:
+                _safe_rollback(conn)
+        try:
+            metrics.untagged_left, metrics.tag_abandoned = _queue_counts(conn)
+        except Exception:
+            pass
+        try:
+            _append_log(metrics)
+        except Exception:
+            pass
         raise
 
     _append_log(metrics)

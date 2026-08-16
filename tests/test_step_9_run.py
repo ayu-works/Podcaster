@@ -157,6 +157,65 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(cutoff, "2026-08-10 10:00:00")
                 send.assert_not_called()
 
+    def test_cleanup_rollback_failure_does_not_mask_pipeline_error(self):
+        class RollbackFailingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def rollback(self):
+                raise RuntimeError("cleanup stream expired")
+
+        with db.session(self.path) as conn:
+            proxy = RollbackFailingConnection(conn)
+            with patch.object(
+                pipeline.fetch,
+                "fetch_all",
+                side_effect=RuntimeError("original fetch failure"),
+            ), patch.object(pipeline.email_out, "deliver_all") as send:
+                with self.assertRaisesRegex(RuntimeError, "original fetch failure"):
+                    pipeline.execute(proxy)
+            latest = conn.execute("SELECT status FROM run ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(latest["status"], "failed")
+        send.assert_not_called()
+
+    def test_fetch_transaction_is_committed_before_tagging(self):
+        observed_cutoffs = []
+
+        def fetch_without_commit(target, run_id):
+            target.execute(
+                "UPDATE run SET fetch_cutoff_at='2026-08-16 10:00:00' WHERE id=?",
+                (run_id,),
+            )
+            return SimpleNamespace(shows=240, after_filter=10)
+
+        def observe_from_separate_connection(*_args, **_kwargs):
+            with db.session(self.path) as observer:
+                observed_cutoffs.append(
+                    observer.execute(
+                        "SELECT fetch_cutoff_at FROM run ORDER BY id DESC LIMIT 1"
+                    ).fetchone()[0]
+                )
+            return self.tag_result()
+
+        with db.session(self.path) as conn, patch.object(
+            pipeline.fetch, "fetch_all", side_effect=fetch_without_commit
+        ), patch.object(
+            pipeline.tag, "tag_all", side_effect=observe_from_separate_connection
+        ), patch.object(
+            pipeline.curate,
+            "curate",
+            return_value=SimpleNamespace(counts_by_topic={}),
+        ), patch.object(
+            pipeline.email_out,
+            "deliver_all",
+            return_value=SimpleNamespace(sent=0, failed=0),
+        ):
+            pipeline.execute(conn)
+        self.assertEqual(observed_cutoffs, ["2026-08-16 10:00:00"])
+
     def test_delivery_failure_is_partial_and_advances_clock(self):
         events = []
         delivery = SimpleNamespace(sent=2, failed=1)
@@ -206,6 +265,17 @@ class RunTests(unittest.TestCase):
         self.assertIn('description: "Preview without sending or persisting tags"', workflow)
         dry_run_section = workflow.split("dry_run:", 1)[1].split("tag_limit:", 1)[0]
         self.assertIn("default: true", dry_run_section)
+
+    def test_short_digest_skips_fetch_and_cannot_send(self):
+        workflow = (ROOT / ".github/workflows/short-digest.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("name: short digest", workflow)
+        self.assertIn("--skip-fetch", workflow)
+        self.assertIn("--tag-limit 20", workflow)
+        self.assertIn("--dry-run", workflow)
+        self.assertNotIn("PODCASTINDEX_KEY", workflow)
+        self.assertIn('paths:\n      - ".github/workflows/short-digest.yml"', workflow)
 
 
 if __name__ == "__main__":

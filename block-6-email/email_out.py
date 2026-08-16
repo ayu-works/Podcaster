@@ -215,12 +215,17 @@ def deliver_subscriber(conn, subscriber, run_id: int, dry_run: bool = False) -> 
             subscriber["email"], subject, html, subscriber["unsub_token"]
         )
     except EmailError as exc:
+        db.ensure_connection(conn)
         _mark(conn, subscriber["id"], episode_ids, "failed", str(exc))
         return Delivery(
             subscriber["id"], subscriber["email"], "failed", episode_ids,
             subject=subject, html=html, error=str(exc),
         )
 
+    # Resend is external and the pending marker was committed before it. Use
+    # a harmless read to refresh an expired Turso stream before recording the
+    # final outcome.
+    db.ensure_connection(conn)
     _mark(conn, subscriber["id"], episode_ids, "sent")
     return Delivery(
         subscriber["id"], subscriber["email"], "sent", episode_ids,
@@ -249,9 +254,13 @@ def deliver_all(
         # deliver_subscriber. This outer guard also isolates an unexpected
         # recipient-specific render or database problem from later recipients.
         try:
+            db.ensure_connection(conn)
             delivery = deliver_subscriber(conn, subscriber, run_id, dry_run=dry_run)
         except Exception as exc:  # noqa: BLE001 -- isolation is the contract
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             delivery = Delivery(
                 subscriber["id"], subscriber["email"], "failed",
                 error=f"{type(exc).__name__}: {exc}",

@@ -217,6 +217,9 @@ def _record_attempt(
         "UPDATE episode SET tag_attempts = tag_attempts + 1, tag_error = NULL WHERE id = ?",
         [(row["id"],) for row in rows],
     )
+    # Never hold a remote transaction open while waiting for Groq. Besides
+    # blocking concurrent writers, Turso can retire the idle HTTP stream.
+    conn.commit()
 
 
 def _call(
@@ -240,6 +243,7 @@ def _call(
         if state.tokens_used + estimate_call_tokens(prompt) > budget:
             raise BudgetExhausted
         _pace(state)
+        db.ensure_connection(conn)
         _record_attempt(conn, rows, state, dry_run)
         try:
             state.last_call_at = time.monotonic()
@@ -264,6 +268,9 @@ def _call(
         used = int(getattr(usage, "total_tokens", 0) or estimate_call_tokens(prompt))
         state.last_call_tokens = used
         state.tokens_used += used
+        # The model call itself can outlive Turso's idle stream. Refresh with
+        # a retry-safe read before the next database operation.
+        db.ensure_connection(conn)
         log_call(batch_id, "retry" if len(messages) > 2 else "tag", prompt, raw)
         return raw
     raise TagError("unreachable call retry state")
@@ -355,6 +362,7 @@ def tag_all(
                 break
             except TagError as exc:
                 if not dry_run:
+                    db.ensure_connection(conn)
                     conn.executemany(
                         "UPDATE episode SET tag_error = ? WHERE id = ?",
                         [(str(exc), row["id"]) for row in batch],

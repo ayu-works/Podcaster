@@ -160,9 +160,14 @@ class EmailTests(unittest.TestCase):
                     observer.close()
                 return "message-1"
 
-            with patch.object(email_out, "send", side_effect=observe_pending):
+            with patch.object(
+                email_out.db,
+                "ensure_connection",
+                wraps=email_out.db.ensure_connection,
+            ) as refresh, patch.object(email_out, "send", side_effect=observe_pending):
                 delivery = email_out.deliver_subscriber(conn, subscriber, self.run_id)
         self.assertEqual(delivery.kind, "sent")
+        self.assertEqual(refresh.call_count, 1)
 
     def test_failure_isolated_and_failed_attempt_retries(self):
         with db.session(self.path) as conn:

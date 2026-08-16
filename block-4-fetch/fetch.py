@@ -353,6 +353,9 @@ def fetch_all(
     discovered_count = 0
     if refresh_discovery:
         discovery = discover.discover_recent(window)
+        # Category discovery is an external HTTP phase. A committed Turso
+        # connection may lose its idle stream while those requests run.
+        db.ensure_connection(conn)
         discovered_count = discovery.found
         discover.save_discovered(conn, discovery.selected)
         conn.commit()
@@ -370,6 +373,9 @@ def fetch_all(
         return result
 
     episodes, result.raw, result.feed_errors = fetch_feeds(shows, window, progress=progress)
+    # Resume database work through a retry-safe read; never retry an episode
+    # write whose server-side outcome could be uncertain.
+    db.ensure_connection(conn)
     candidates, result.dropped = filter_episodes(episodes)
     guids = {episode.guid for episode in candidates}
     existing: set[str] = set()
