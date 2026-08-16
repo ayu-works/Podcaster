@@ -1,9 +1,9 @@
-"""Vercel Python entry point."""
+"""Vercel Flask entry point."""
 
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 ONBOARDING = str(ROOT / "block-3-onboarding")
 if ONBOARDING not in sys.path:
     sys.path.insert(0, ONBOARDING)

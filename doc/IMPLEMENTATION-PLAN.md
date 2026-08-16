@@ -86,8 +86,8 @@ unsubscribe.
 Completed. The old free-text box, background universe build, job registry,
 polling endpoints, and waiting page were removed. Signup stores exact topic
 slugs and uses double opt-in. Unsubscribe GET is scanner-safe and POST is
-idempotent. Honeypot and per-IP throttling are present. `api/index.py` exports
-the Flask app for Vercel.
+idempotent. Honeypot and per-IP throttling are present. The repository-root
+`index.py` exports the Flask app through Vercel's zero-config Flask entry point.
 
 ## Step 9 — orchestration and scheduling
 

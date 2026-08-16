@@ -182,6 +182,11 @@ class RunTests(unittest.TestCase):
         tag_call.assert_not_called()
         self.assertEqual((metrics.status, metrics.fetched), ("ok", 25))
 
+    def test_vercel_uses_zero_config_root_flask_entrypoint(self):
+        entrypoint = (ROOT / "index.py").read_text(encoding="utf-8")
+        self.assertIn("from app import app", entrypoint)
+        self.assertFalse((ROOT / "vercel.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,8 +19,7 @@ Routes:
 - `POST /unsubscribe/<token>` — idempotently unsubscribe.
 
 A hidden honeypot and a small per-IP throttle provide light abuse control.
-`api/index.py` exports the app for Vercel.
-Vercel uses the repository-root `requirements.txt` for this block's runtime
-dependencies and `vercel.json` to send `/`, confirmation, and unsubscribe
-routes to `api/index.py`. `.python-version` keeps Vercel on Python 3.12, the
-same runtime used by GitHub Actions and one with an official `libsql` wheel.
+The repository-root `index.py` exports the app through Vercel's zero-config
+Flask entry point, and the root `requirements.txt` supplies its runtime
+dependencies. `.python-version` keeps Vercel on Python 3.12, the same runtime
+used by GitHub Actions and one with an official `libsql` wheel.
