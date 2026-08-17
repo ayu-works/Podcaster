@@ -28,11 +28,11 @@ CREATE TABLE IF NOT EXISTS subscriber (
     id            INTEGER PRIMARY KEY,
     email         TEXT NOT NULL UNIQUE,
     unsub_token   TEXT NOT NULL UNIQUE,     -- must be unguessable; see block-3
-    confirm_token TEXT NOT NULL UNIQUE,
+    confirm_token TEXT NOT NULL UNIQUE,     -- vestigial; see doc/single-opt-in.md
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    confirmed_at  TEXT,                     -- NULL until double opt-in completes
-    -- pending until /confirm/<token>; only 'active' ever receives a digest
-    -- (ARCHITECTURE section 7, "Anyone can subscribe anyone").
+    confirmed_at  TEXT,                     -- stamped at signup since single opt-in
+    -- Signup writes 'active' directly; the 'pending' default survives only for
+    -- rows predating single opt-in. Only 'active' ever receives a digest.
     status        TEXT NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending', 'active', 'paused', 'unsubscribed'))
 );

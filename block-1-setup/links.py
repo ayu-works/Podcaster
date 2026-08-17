@@ -19,6 +19,8 @@ a link.
 
 import urllib.parse
 
+import config
+
 # Extensions that mean "this is the media file, not a page about it". Podcast
 # audio is nearly always mp3 or m4a; the rest cover video shows and the few
 # feeds that publish ogg/opus.
@@ -113,3 +115,16 @@ def episode_page_url(link=None, itunes_id=None, enclosure_url=None) -> str:
     if candidate and candidate != enclosure and is_page_url(candidate):
         return candidate
     return apple_show_url(itunes_id)
+
+
+def site_url(path: str) -> str:
+    """Absolute URL on the public onboarding host."""
+    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+
+
+def unsubscribe_url(token: str) -> str:
+    return site_url(f"unsubscribe/{token}")
+
+
+def confirmation_url(token: str) -> str:
+    return site_url(f"confirm/{token}")

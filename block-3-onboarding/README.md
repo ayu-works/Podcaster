@@ -2,8 +2,9 @@
 
 The Flask app renders the 20 `config.TOPICS` checkboxes and an email field.
 Signup writes only those topic slugs and returns immediately; it never builds a
-show list. New and renewed subscribers remain `pending` until they click the
-double-opt-in confirmation email.
+show list. Signup is single opt-in — new and renewed subscribers are `active`
+the moment the form is posted, and a welcome email follows (see
+`doc/single-opt-in.md`).
 
 ```bash
 cd block-3-onboarding
@@ -13,8 +14,8 @@ cd block-3-onboarding
 Routes:
 
 - `GET /` — topic form.
-- `POST /subscribe` — validate, save topics, send confirmation.
-- `GET /confirm/<token>` — idempotently activate.
+- `POST /subscribe` — validate, save topics, activate, send welcome email.
+- `GET /confirm/<token>` — idempotent; only still activates legacy `pending` rows.
 - `GET /unsubscribe/<token>` — render only; scanners may prefetch it.
 - `POST /unsubscribe/<token>` — idempotently unsubscribe.
 

@@ -1,0 +1,88 @@
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;">
+  Four mornings a week, only the episodes that earn your time.
+</div>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
+       style="background-color:#f5f3f0;margin:0;padding:0;">
+  <tr><td align="center" style="padding:28px 12px 40px;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600"
+           style="width:100%;max-width:600px;background:#fff;border-radius:14px;overflow:hidden;">
+
+      <!-- 1. masthead -->
+      <tr><td style="padding:30px 30px 0;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;">
+        <p style="margin:0;font-size:11px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:#ff8a4c;">Podcaster</p>
+        <p style="margin:14px 0 0;font-size:22px;line-height:1.3;font-weight:600;color:#17151a;">You're subscribed.</p>
+        <p style="margin:8px 0 0;font-size:14px;color:#8b8794;">Here's what lands in your inbox.</p>
+      </td></tr>
+
+      <!-- 2. what we do -->
+      <tr><td style="padding:26px 30px 0;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+          <tr>
+            <td width="44" valign="top" style="width:44px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="44" height="44" style="width:44px;height:44px;background:#faf7f4;border-radius:50%;">
+                <tr><td align="center" valign="middle" style="font-size:22px;line-height:44px;">&#128269;</td></tr>
+              </table>
+            </td>
+            <td style="padding-left:14px;font-size:15px;line-height:1.55;color:#4a4552;">
+              Four mornings a week we scan every new episode in your topics.
+            </td>
+          </tr>
+        </table>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:16px;">
+          <tr>
+            <td width="44" valign="top" style="width:44px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="44" height="44" style="width:44px;height:44px;background:#faf7f4;border-radius:50%;">
+                <tr><td align="center" valign="middle" style="font-size:22px;line-height:44px;">&#127919;</td></tr>
+              </table>
+            </td>
+            <td style="padding-left:14px;font-size:15px;line-height:1.55;color:#4a4552;">
+              Each one is scored on whether it actually earns your time.
+            </td>
+          </tr>
+        </table>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:16px;">
+          <tr>
+            <td width="44" valign="top" style="width:44px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="44" height="44" style="width:44px;height:44px;background:#faf7f4;border-radius:50%;">
+                <tr><td align="center" valign="middle" style="font-size:22px;line-height:44px;">&#128233;</td></tr>
+              </table>
+            </td>
+            <td style="padding-left:14px;font-size:15px;line-height:1.55;color:#4a4552;">
+              You get up to ten, each with a line on why it made the cut.
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+
+      <!-- 3. topics as chips -->
+      <tr><td style="padding:26px 30px 0;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;">
+        <p style="margin:0 0 10px;font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#8b8794;">Your topics</p>
+        {% for topic in topics %}<span style="display:inline-block;margin:0 6px 8px 0;padding:7px 14px;background:#faf7f4;border:1px solid #e8e4df;border-radius:999px;font-size:13px;color:#4a4552;">{{ topic }}</span>{% endfor %}
+      </td></tr>
+
+      <!-- 4. the promise -->
+      <tr><td style="padding:22px 30px 0;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#faf7f4;border-left:3px solid #ff8a4c;border-radius:0 8px 8px 0;">
+          <tr><td style="padding:13px 16px;font-size:15px;line-height:1.55;color:#4a4552;">
+            Nothing worth sending means nothing gets sent. Quiet weeks stay quiet.
+          </td></tr>
+        </table>
+      </td></tr>
+
+      <!-- 5. footer. The "wasn't you" line is the only thing standing between
+           a wrongly-entered address and recurring mail now that signup no
+           longer waits for a confirmation click, so it is deliberately louder
+           than the ordinary unsubscribe beneath it. -->
+      <tr><td style="padding:30px;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;">
+        <p style="margin:0;padding-top:20px;border-top:1px solid #e8e4df;font-size:14px;line-height:1.6;color:#4a4552;">
+          You're receiving this because this address was entered at {{ site_url }}.
+          Didn't sign up?
+          <a href="{{ not_me_url }}" style="color:#ff8a4c;font-weight:600;">Remove this address &rarr;</a>
+        </p>
+        <p style="margin:14px 0 0;font-size:12.5px;line-height:1.6;color:#a5a1ac;">
+          <a href="{{ unsubscribe_url }}" style="color:#8b8794;">Unsubscribe</a>
+        </p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>

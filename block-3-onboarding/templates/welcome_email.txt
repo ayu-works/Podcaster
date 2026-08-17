@@ -1,0 +1,14 @@
+You're subscribed to Podcaster.
+
+Four mornings a week we scan every new episode in your topics.
+Each one is scored on whether it actually earns your time.
+You get up to ten, each with a line on why it made the cut.
+
+Your topics: {{ topics|join(', ') }}
+
+Nothing worth sending means nothing gets sent. Quiet weeks stay quiet.
+
+You're receiving this because this address was entered at {{ site_url }}.
+Didn't sign up? Remove this address: {{ not_me_url }}
+
+Unsubscribe: {{ unsubscribe_url }}

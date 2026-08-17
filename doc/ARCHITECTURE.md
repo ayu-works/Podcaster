@@ -161,9 +161,19 @@ enclosure is ever *sent*, not merely that none is stored.
 
 ## 7. Hosted security and failure behavior
 
-New subscribers are `pending`. Only a confirmation link makes them `active`,
-so an attacker cannot enroll a stranger into recurring mail. Confirmation and
-unsubscribe tokens are separate `secrets.token_urlsafe(32)` values.
+Signup is single opt-in (see `doc/single-opt-in.md` for why): `POST
+/subscribe` makes a subscriber `active` immediately, so an attacker *can*
+enroll a stranger's address, and the welcome email is the mitigation, not
+`pending`. It names who signed the address up, gives the one-click "didn't
+sign up" removal its own accent-typed line above the ordinary unsubscribe,
+and carries `List-Unsubscribe` /
+`List-Unsubscribe-Post: One-Click` headers so a mail client's own unsubscribe
+control works too. That, plus the existing honeypot and per-IP throttle
+below, replaces the old confirm-before-activation gate. `confirm_token` is
+still generated and `/confirm/<token>` still exists — vestigial, kept only
+because there is no migration path off the `NOT NULL UNIQUE` column and
+because old confirmation links are already sitting in inboxes. Confirmation
+and unsubscribe tokens remain separate `secrets.token_urlsafe(32)` values.
 
 `GET /unsubscribe/<token>` is read-only because mail scanners prefetch links.
 Only POST mutates, and repeated or unknown POSTs return the same success page.
@@ -179,12 +189,17 @@ no free-text box: delivery matches stored slugs, so arbitrary prose has no
 architectural consumer without reintroducing per-user model work.
 
 `POST /subscribe` validates at least one known topic, stores the exact topic
-set, sends confirmation synchronously, and renders immediately. Re-subscribing
-an active address updates its topics. Re-subscribing a paused/unsubscribed
-address rotates both tokens and requires confirmation again.
+set, activates the subscriber, and sends a welcome email synchronously — a
+failed welcome send is logged but does not fail the request, since the
+subscription is already live and the mail is not load-bearing. Re-subscribing
+an active address only updates its topics and sends nothing. Re-subscribing a
+paused/unsubscribed address rotates both tokens, reactivates the row, and
+sends a fresh welcome email.
 
-`GET /confirm/<token>` is idempotent. GET unsubscribe only renders; POST
-unsubscribe mutates idempotently without revealing token validity.
+`GET /confirm/<token>` is now a harmless no-op for a normal signup (the row
+is already `active`) and only still matters for a legacy `pending` row, which
+it activates. GET unsubscribe only renders; POST unsubscribe mutates
+idempotently without revealing token validity.
 
 ## 9. Configuration and capacity
 

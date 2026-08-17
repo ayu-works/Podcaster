@@ -1,4 +1,4 @@
-"""Immediate topic signup, double opt-in, and scanner-safe unsubscribe."""
+"""Single opt-in topic signup, welcome email, and scanner-safe unsubscribe."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from collections import defaultdict, deque
 import resend
 from flask import Flask, render_template, request, url_for
 
-from _shared import config, db
+from _shared import config, db, links
 
 app = Flask(__name__)
 
@@ -20,9 +20,17 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
 _SIGNUPS: dict[str, deque[float]] = defaultdict(deque)
 _SIGNUPS_LOCK = threading.Lock()
 
+# Shared between the honeypot branch and a genuine signup so the two are
+# byte-identical; that indistinguishability is the whole point of the trap.
+SUBSCRIBED_TITLE = "You're subscribed"
+SUBSCRIBED_BODY = (
+    "Your first digest arrives on the next run — up to ten episodes, "
+    "and only the ones that earn it."
+)
 
-class ConfirmationEmailError(RuntimeError):
-    """The double-opt-in message could not be handed to Resend."""
+
+class WelcomeEmailError(RuntimeError):
+    """The welcome message could not be handed to Resend."""
 
 
 def _signup_ip() -> str:
@@ -44,30 +52,48 @@ def rate_limited(ip: str, now: float | None = None) -> bool:
         return False
 
 
-def confirmation_url(token: str) -> str:
-    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/confirm/{token}"
+def _new_tokens() -> tuple[str, str]:
+    """Distinct confirm and unsubscribe tokens."""
+    confirm_token = secrets.token_urlsafe(32)
+    unsub_token = secrets.token_urlsafe(32)
+    while unsub_token == confirm_token:  # defensive; practically impossible
+        unsub_token = secrets.token_urlsafe(32)
+    return confirm_token, unsub_token
 
 
-def send_confirmation(email: str, token: str) -> str:
+def send_welcome(email: str, topics: list[str], unsub_token: str) -> str:
     if not config.RESEND_API_KEY or config.RESEND_API_KEY.startswith("your_"):
-        raise ConfirmationEmailError("RESEND_API_KEY missing from .env")
+        raise WelcomeEmailError("RESEND_API_KEY missing from .env")
+    if config.localhost_base_url():
+        app.logger.warning(
+            "PUBLIC_BASE_URL is a localhost address; welcome email links will be dead in the wild"
+        )
     resend.api_key = config.RESEND_API_KEY
-    link = confirmation_url(token)
+    labels = dict(config.TOPICS)
+    context = {
+        "topics": [labels[slug] for slug in topics],
+        "unsubscribe_url": links.unsubscribe_url(unsub_token),
+        "not_me_url": links.unsubscribe_url(unsub_token) + "?not-me=1",
+        "site_url": config.PUBLIC_BASE_URL.rstrip("/"),
+    }
     try:
         response = resend.Emails.send(
             {
                 "from": config.FROM_EMAIL,
                 "to": [email],
-                "subject": "Confirm your Podcaster subscription",
-                "html": (
-                    "<p>Confirm that you want Podcaster's curated episode digest.</p>"
-                    f'<p><a href="{link}">Confirm my subscription</a></p>'
-                    "<p>If you did not request this, ignore this email.</p>"
-                ),
+                "subject": "You're subscribed to Podcaster",
+                "html": render_template("welcome_email.html", **context),
+                # A text/plain alternative is one of the cheapest real
+                # spam-score wins, and nothing this project sends has one yet.
+                "text": render_template("welcome_email.txt", **context),
+                "headers": {
+                    "List-Unsubscribe": f"<{context['unsubscribe_url']}>",
+                    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+                },
             }
         )
     except Exception as exc:
-        raise ConfirmationEmailError(f"{type(exc).__name__}: {exc}") from exc
+        raise WelcomeEmailError(f"{type(exc).__name__}: {exc}") from exc
     if isinstance(response, dict):
         return response.get("id", "")
     return getattr(response, "id", "") or ""
@@ -86,32 +112,36 @@ def _selected_topics() -> tuple[list[str], str]:
 
 
 def _save_signup(conn, email: str, topics: list[str]) -> tuple[str, bool]:
-    """Return confirmation token and whether a message must be sent."""
+    """Return the unsubscribe token and whether a welcome mail must be sent.
+
+    Signup is single opt-in: the row is active the moment the form is posted.
+    `confirm_token` is still issued because the column is NOT NULL UNIQUE and
+    there is no migration path, and because /confirm stays alive for links
+    already sitting in inboxes.
+    """
     row = conn.execute(
-        "SELECT id, status, confirm_token FROM subscriber WHERE email=?", (email,)
+        "SELECT id, status, unsub_token FROM subscriber WHERE email=?", (email,)
     ).fetchone()
     if row is None:
-        confirm_token = secrets.token_urlsafe(32)
-        unsub_token = secrets.token_urlsafe(32)
-        while unsub_token == confirm_token:  # defensive; practically impossible
-            unsub_token = secrets.token_urlsafe(32)
+        confirm_token, unsub_token = _new_tokens()
         subscriber_id = conn.execute(
-            "INSERT INTO subscriber (email, unsub_token, confirm_token, status) "
-            "VALUES (?, ?, ?, 'pending')",
+            "INSERT INTO subscriber (email, unsub_token, confirm_token, status, "
+            "confirmed_at) VALUES (?, ?, ?, 'active', datetime('now'))",
             (email, unsub_token, confirm_token),
         ).lastrowid
-        needs_confirmation = True
+        needs_welcome = True
     else:
         subscriber_id = row["id"]
-        confirm_token = row["confirm_token"]
-        needs_confirmation = row["status"] != "active"
-        if row["status"] in ("paused", "unsubscribed"):
-            confirm_token = secrets.token_urlsafe(32)
-            unsub_token = secrets.token_urlsafe(32)
-            while unsub_token == confirm_token:
-                unsub_token = secrets.token_urlsafe(32)
+        unsub_token = row["unsub_token"]
+        needs_welcome = row["status"] != "active"
+        if needs_welcome:
+            # Returning from unsubscribed/paused, or a legacy pending row.
+            # Rotating unsub_token retires the link in any digest already sent,
+            # which is the existing behaviour and the correct one.
+            confirm_token, unsub_token = _new_tokens()
             conn.execute(
-                "UPDATE subscriber SET status='pending', confirmed_at=NULL, "
+                "UPDATE subscriber SET status='active', "
+                "confirmed_at=COALESCE(confirmed_at, datetime('now')), "
                 "confirm_token=?, unsub_token=? WHERE id=?",
                 (confirm_token, unsub_token, subscriber_id),
             )
@@ -121,7 +151,7 @@ def _save_signup(conn, email: str, topics: list[str]) -> tuple[str, bool]:
         "INSERT INTO subscription (subscriber_id, topic) VALUES (?, ?)",
         [(subscriber_id, topic) for topic in topics],
     )
-    return confirm_token, needs_confirmation
+    return unsub_token, needs_welcome
 
 
 @app.get("/")
@@ -142,8 +172,8 @@ def subscribe():
     if request.form.get("company", "").strip():
         return render_template(
             "message.html",
-            title="Check your inbox",
-            message="A confirmation link is on its way. It must be clicked before any digest is sent.",
+            title=SUBSCRIBED_TITLE,
+            message=SUBSCRIBED_BODY,
         )
 
     if rate_limited(_signup_ip()):
@@ -170,20 +200,17 @@ def subscribe():
         )
 
     with db.session() as conn:
-        confirm_token, needs_confirmation = _save_signup(conn, email, topics)
+        unsub_token, needs_welcome = _save_signup(conn, email, topics)
 
-    if needs_confirmation:
+    if needs_welcome:
         try:
-            send_confirmation(email, confirm_token)
-        except ConfirmationEmailError:
-            app.logger.exception("confirmation email failed for %s", email)
-            return render_template(
-                "message.html",
-                title="Saved, but email is delayed",
-                message="Your topics are saved. Please try subscribing again in a few minutes to resend confirmation.",
-            ), 503
-        title = "Check your inbox"
-        message = "Click the confirmation link before any podcast digest can be sent."
+            send_welcome(email, topics, unsub_token)
+        except WelcomeEmailError:
+            # The subscription is already live; the welcome note is not
+            # load-bearing. Log it and let the person get on with their day.
+            app.logger.exception("welcome email failed for %s", email)
+        title = SUBSCRIBED_TITLE
+        message = SUBSCRIBED_BODY
     else:
         title = "Preferences updated"
         message = "Your new topic selection will be used for the next digest."
@@ -201,15 +228,20 @@ def confirm(token: str):
         )
     return render_template(
         "message.html",
-        title="Subscription confirmed",
-        message="You're ready. The next strong episodes matching your topics will arrive by email.",
+        title="You're all set",
+        message="This address is subscribed. The next strong episodes matching your topics will arrive by email.",
     )
 
 
 @app.get("/unsubscribe/<token>")
 def unsubscribe_prompt(token: str):
     # GET is deliberately read-only: mail security scanners prefetch links.
-    return render_template("unsubscribe.html", token=token, complete=False)
+    return render_template(
+        "unsubscribe.html",
+        token=token,
+        complete=False,
+        not_me=request.args.get("not-me") == "1",
+    )
 
 
 @app.post("/unsubscribe/<token>")
@@ -220,7 +252,7 @@ def unsubscribe(token: str):
             (token,),
         )
     # Identical response for valid, already-used, and unknown tokens.
-    return render_template("unsubscribe.html", token=token, complete=True)
+    return render_template("unsubscribe.html", token=token, complete=True, not_me=False)
 
 
 def main() -> int:

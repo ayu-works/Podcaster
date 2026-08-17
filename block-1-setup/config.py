@@ -239,3 +239,8 @@ def missing_keys(block: int | None = None) -> list[str]:
     """
     names = KEYS_BY_BLOCK[block] if block else REQUIRED_KEYS
     return [n for n in names if not (v := globals().get(n, "")) or v.startswith("your_")]
+
+
+def localhost_base_url() -> bool:
+    """True when a real send would ship links nobody can open."""
+    return any(h in PUBLIC_BASE_URL for h in ("127.0.0.1", "localhost"))

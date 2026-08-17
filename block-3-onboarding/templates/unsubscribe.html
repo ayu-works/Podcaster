@@ -5,6 +5,13 @@
 {% if complete %}
 <h1>You're unsubscribed.</h1>
 <p class="lede">No more digests will be sent. This request is safe to repeat.</p>
+{% elif not_me %}
+<h1>Remove this address?</h1>
+<p class="lede">Someone entered this address on Podcaster. Confirm below and it
+will never be mailed again.</p>
+<form method="post" action="{{ url_for('unsubscribe', token=token) }}">
+  <button class="go flush" type="submit">Yes, remove it</button>
+</form>
 {% else %}
 <h1>Stop receiving Podcaster?</h1>
 <p class="lede">This removes this email address from future digests.</p>

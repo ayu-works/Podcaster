@@ -38,13 +38,13 @@
 
   <div class="field">
     <label class="step" for="email"><span>2</span>Where should it arrive?</label>
-    <p class="hint">We'll send one confirmation link first. No confirmation, no digest.</p>
+    <p class="hint">One click and you're in. No account, no password.</p>
     <input type="email" id="email" name="email" placeholder="you@example.com"
            autocomplete="email" required value="{{ form.get('email', '') }}">
   </div>
 
   <button class="go" type="submit" id="go" {% if missing_keys %}disabled{% endif %}>
-    Send confirmation
+    Subscribe
   </button>
   <p class="foot">No daily filler. No account or password. Unsubscribe in one click.</p>
 </form>

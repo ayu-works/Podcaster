@@ -28,7 +28,7 @@ production input. Dynamic discovery refreshes on every run.
 |---|---|
 | `block-1-setup/` | config, nine-table schema, SQLite/Turso connection |
 | `block-2-universe/` | Podcast Index client, dynamic category discovery, reference seed tooling |
-| `block-3-onboarding/` | Flask topics form, double opt-in, unsubscribe |
+| `block-3-onboarding/` | Flask topics form, single opt-in, welcome mail, unsubscribe |
 | `block-4-fetch/` | batched episode retrieval and deterministic filtering |
 | `block-5-tag/` | shared episode tagging and deterministic curation |
 | `block-6-email/` | per-subscriber selection, rendering, safe delivery |
@@ -59,7 +59,11 @@ workflow uses `staged.py` so Fetch, Tag, Curate, and Send have separate limits.
   pending and sent are not.
 - Fetch/tag/curate failures stop the pipeline as `failed`. Recipient failures
   are isolated and make the run `partial`.
-- Pending subscribers receive nothing. A GET unsubscribe request never mutates.
+- Signup is single opt-in: `POST /subscribe` activates immediately and sends a
+  welcome email. `pending` now only appears on legacy rows predating this
+  change; such a row still receives nothing until `/confirm` or a fresh
+  signup activates it. A GET unsubscribe request never mutates. See
+  `doc/single-opt-in.md`.
 - Make silent degradation visible: all-feed failure raises, generic why-lines
   fail validation, quiet topics are never padded, and every run logs metrics.
 

@@ -58,7 +58,7 @@ problem.
 | R5 | Curate at most ten shared picks per topic with relevance, staleness, and per-show guarantees. |
 | R6 | Merge picks per active subscriber, dedupe, cap at ten, respect per-user history, and make zero model calls. |
 | R7 | Commit pending delivery attempts before Resend; retry failed, never blindly retry ambiguous pending. |
-| R8 | Require double opt-in; tokenized GET unsubscribe is read-only and POST is idempotent. |
+| R8 | ~~Require double opt-in~~ superseded 2026-08-17 by single opt-in plus a welcome mail carrying a prominent one-click removal (`doc/single-opt-in.md`); tokenized GET unsubscribe is read-only and POST is idempotent. |
 | R9 | Run in GitHub Actions at 07:00 IST Sun/Mon/Wed/Fri, with Turso state and logs uploaded on every outcome. |
 | R10 | Log discovery, fetch, tag queue/cost/distribution, curation, subscriber, delivery, and status metrics per run. |
 

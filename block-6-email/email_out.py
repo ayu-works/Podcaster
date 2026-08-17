@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import webbrowser
 from collections import Counter
@@ -16,6 +17,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from _shared import config, db, links
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+logger = logging.getLogger(__name__)
 
 
 class EmailError(RuntimeError):
@@ -116,7 +118,7 @@ def load_picks(
 
 
 def unsubscribe_url(token: str) -> str:
-    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/unsubscribe/{token}"
+    return links.unsubscribe_url(token)
 
 
 def render(picks: list[dict], token: str) -> str:
@@ -157,6 +159,8 @@ def subject_line(picks: list[dict]) -> str:
 def send(to: str, subject: str, html: str, token: str) -> str:
     if not config.RESEND_API_KEY or config.RESEND_API_KEY.startswith("your_"):
         raise EmailError("RESEND_API_KEY missing from .env")
+    if config.localhost_base_url():
+        logger.warning("PUBLIC_BASE_URL is a localhost address; digest links will be dead in the wild")
     url = unsubscribe_url(token)
     resend.api_key = config.RESEND_API_KEY
     try:
